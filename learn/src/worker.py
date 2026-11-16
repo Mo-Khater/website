@@ -4978,7 +4978,7 @@ async def api_tutor_reindex(req, env, activity_ref: str):
     except Exception as exc:
         await capture_exception(exc, req, env, "api_tutor_reindex")
         return err("Failed to index course materials — please try again", 500)
-    return ok(stats, "Tutor index updated")
+    return ok(stats, "Tutor index updated. New content can take up to a minute to become searchable.")
 
 
 async def api_tutor_search(req, env, activity_ref: str):

@@ -244,7 +244,9 @@ MAX_EXTRACTED_CHARS = 200_000
 MAX_PPTX_XML_BYTES = 20 * 1024 * 1024   # uncompressed; guards against zip bombs
 MAX_SLIDES = 500
 
-_HEADING_RE = re.compile(r"^#{1,6}\s+(.+?)\s*#*\s*$")
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
+_PAGE_HEADING_RE = re.compile(r"^page\s+(\d+)$", re.I)
+_METADATA_LINE_RE = re.compile(r"^-\s*[A-Za-z][\w ]*=")
 
 
 def _extension(key: str) -> str:
@@ -266,20 +268,49 @@ def _cap_sections(sections: Sections, limit: Optional[int] = None) -> Sections:
 
 
 def split_markdown_sections(markdown: str) -> Sections:
-    """Split Markdown at headings; each section is located by its heading."""
+    """Split Markdown at headings; each section is located by its heading.
+
+    A "Page N" heading (how Workers AI toMarkdown marks PDF pages) gives the
+    locator "page N", and headings nested under it keep the page number:
+    "page 3, section: Mitosis". Sections that are only a heading are dropped.
+    """
     sections: Sections = []
     locator, lines = "", []
+    page = None   # (heading level, page number) of the enclosing "Page N" heading
+
+    def flush():
+        body = "\n".join(l for l in lines if not _HEADING_RE.match(l.strip()))
+        if body.strip():
+            sections.append({"locator": locator, "text": "\n".join(lines).strip()})
+
     for line in (markdown or "").replace("\r\n", "\n").split("\n"):
         m = _HEADING_RE.match(line.strip())
-        if m:
-            if "\n".join(lines).strip():
-                sections.append({"locator": locator, "text": "\n".join(lines)})
-            locator, lines = f"section: {m.group(1)[:80]}", [line]
-        else:
+        if not m:
             lines.append(line)
-    if "\n".join(lines).strip():
-        sections.append({"locator": locator, "text": "\n".join(lines)})
+            continue
+        flush()
+        level, title = len(m.group(1)), m.group(2)[:80]
+        page_match = _PAGE_HEADING_RE.match(title)
+        if page_match:
+            page = (level, page_match.group(1))
+            locator = f"page {page[1]}"
+        elif page and level > page[0]:
+            locator = f"page {page[1]}, section: {title}"
+        else:
+            page = None
+            locator = f"section: {title}"
+        lines = [line]
+    flush()
     return sections
+
+
+def _is_metadata_section(section: Dict[str, str]) -> bool:
+    """toMarkdown prepends a "## Metadata" list of file properties
+    (producer, creation date, PDF version...) — not course content."""
+    if section["locator"] != "section: Metadata":
+        return False
+    body = [l.strip() for l in section["text"].split("\n")[1:] if l.strip()]
+    return all(_METADATA_LINE_RE.match(l) for l in body)
 
 
 _NS = {
@@ -304,14 +335,37 @@ def _rels(zf: zipfile.ZipFile, part: str) -> Dict[str, Tuple[str, str]]:
     return out
 
 
-def _paragraph_text(xml_bytes: bytes) -> str:
-    """All text in a slide/notes part, one line per paragraph."""
+# Placeholders that hold boilerplate (slide numbers, dates, footers, the
+# slide thumbnail on notes pages), never course content.
+_SKIP_PLACEHOLDERS = {"sldNum", "dt", "ftr", "hdr", "sldImg"}
+
+
+def _paragraph_text(xml_bytes: bytes, notes: bool = False) -> str:
+    """Text of a slide or notes part, one line per paragraph.
+
+    Boilerplate placeholders are skipped. On notes pages only the notes body
+    placeholder is read. Tables and grouped shapes are included.
+    """
     root = ElementTree.fromstring(xml_bytes)
-    lines = []
-    for para in root.iter(f"{{{_NS['a']}}}p"):
-        text = "".join(t.text or "" for t in para.iter(f"{{{_NS['a']}}}t")).strip()
-        if text:
-            lines.append(text)
+    sp_tag, p_tag, t_tag = f"{{{_NS['p']}}}sp", f"{{{_NS['a']}}}p", f"{{{_NS['a']}}}t"
+    lines: List[str] = []
+
+    def walk(el, skip: bool):
+        if el.tag == sp_tag:
+            ph = el.find("p:nvSpPr/p:nvPr/p:ph", _NS)
+            ph_type = (ph.get("type") or "body") if ph is not None else None
+            if ph_type in _SKIP_PLACEHOLDERS or (notes and ph_type != "body"):
+                skip = True
+        if el.tag == p_tag:
+            if not skip:
+                text = "".join(t.text or "" for t in el.iter(t_tag)).strip()
+                if text:
+                    lines.append(text)
+            return
+        for child in el:
+            walk(child, skip)
+
+    walk(root, False)
     return "\n".join(lines)
 
 
@@ -345,9 +399,7 @@ def extract_pptx_sections(data: bytes) -> Sections:
             parts = [_paragraph_text(zf.read(slide))]
             for rel_type, target in _rels(zf, slide).values():
                 if rel_type == _NOTES_REL and target in names:
-                    notes = _paragraph_text(zf.read(target))
-                    # notes slides repeat the slide number placeholder; drop bare digits
-                    notes = "\n".join(l for l in notes.split("\n") if not l.isdigit())
+                    notes = _paragraph_text(zf.read(target), notes=True)
                     if notes:
                         parts.append("Speaker notes:\n" + notes)
             sections.append({"locator": f"slide {number}", "text": "\n\n".join(p for p in parts if p)})
@@ -398,7 +450,8 @@ async def extract_file_sections(env, bucket, key: str) -> Tuple[Sections, Option
         if doc.get("format") == "error":
             detail = str(doc.get("error") or doc.get("data") or "unknown error")[:200]
             return [], f"could not convert file: {detail}"
-        sections = split_markdown_sections(str(doc.get("data") or ""))
+        sections = [sec for sec in split_markdown_sections(str(doc.get("data") or ""))
+                    if not _is_metadata_section(sec)]
 
     sections = _cap_sections(sections)
     if not sections:

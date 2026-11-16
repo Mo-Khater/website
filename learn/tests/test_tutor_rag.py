@@ -90,8 +90,14 @@ class FakeAI:
             if raw.startswith("BROKEN"):
                 out.append({"name": d["name"], "format": "error", "error": "corrupt file"})
             else:
+                # Shape observed from the real service for a PDF: file-name heading,
+                # a Metadata list, an empty Contents heading, then one heading per page.
+                pages = raw.split("\f")
+                body = "\n".join(f"### Page {n}\n{text}" for n, text in enumerate(pages, start=1))
+                md = (f"# {d['name']}\n## Metadata\n- PDFFormatVersion=1.6\n- Producer=LibreOffice 7.3\n"
+                      f"## Contents\n{body}")
                 out.append({"name": d["name"], "mimetype": d["blob"].type,
-                            "format": "markdown", "tokens": 1, "data": "# Converted\n" + raw})
+                            "format": "markdown", "tokens": 1, "data": md})
         self.calls.append(("toMarkdown", [d["name"] for d in docs]))
         return out
 
@@ -226,10 +232,16 @@ _R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 _REL = "http://schemas.openxmlformats.org/package/2006/relationships"
 
 
-def _text_part(root_tag, paragraphs):
+def _shape(paragraphs, ph_type=None):
+    ph = f'<p:ph type="{ph_type}"/>' if ph_type else ""
     paras = "".join(f"<a:p><a:r><a:t>{t}</a:t></a:r></a:p>" for t in paragraphs)
-    return (f'<{root_tag} xmlns:a="{_A}" xmlns:p="{_P}"><p:cSld><p:spTree><p:sp><p:txBody>'
-            f"{paras}</p:txBody></p:sp></p:spTree></p:cSld></{root_tag}>")
+    return (f"<p:sp><p:nvSpPr><p:cNvPr id=\"1\" name=\"s\"/><p:cNvSpPr/><p:nvPr>{ph}</p:nvPr></p:nvSpPr>"
+            f"<p:txBody>{paras}</p:txBody></p:sp>")
+
+
+def _text_part(root_tag, shapes):
+    return (f'<{root_tag} xmlns:a="{_A}" xmlns:p="{_P}"><p:cSld><p:spTree>'
+            f"{''.join(shapes)}</p:spTree></p:cSld></{root_tag}>")
 
 
 def make_pptx(slides, order=None, with_presentation=True):
@@ -247,12 +259,16 @@ def make_pptx(slides, order=None, with_presentation=True):
                            for n in range(1, len(slides) + 1))
             zf.writestr("ppt/_rels/presentation.xml.rels", f'<Relationships xmlns="{_REL}">{rels}</Relationships>')
         for n, (paragraphs, notes) in enumerate(slides, start=1):
-            zf.writestr(f"ppt/slides/slide{n}.xml", _text_part("p:sld", paragraphs))
+            # like real decks: content + a footer and slide-number placeholder
+            zf.writestr(f"ppt/slides/slide{n}.xml", _text_part("p:sld", [
+                _shape(paragraphs), _shape(["Confidential"], "ftr"), _shape([str(n)], "sldNum")]))
             if notes is not None:
                 zf.writestr(f"ppt/slides/_rels/slide{n}.xml.rels",
                             f'<Relationships xmlns="{_REL}"><Relationship Id="rId9" '
                             f'Type="{_R}/notesSlide" Target="../notesSlides/notesSlide{n}.xml"/></Relationships>')
-                zf.writestr(f"ppt/notesSlides/notesSlide{n}.xml", _text_part("p:notes", notes + [str(n)]))
+                # like LibreOffice: notes body + slide image + "<number>" placeholder
+                zf.writestr(f"ppt/notesSlides/notesSlide{n}.xml", _text_part("p:notes", [
+                    _shape([], "sldImg"), _shape(notes, "body"), _shape(["&lt;number&gt;"], "sldNum")]))
     return buf.getvalue()
 
 
@@ -260,10 +276,19 @@ class TestMarkdownSections:
     def test_split_at_headings(self):
         md = "Intro line.\n\n# Cells\nCells are small.\n\n## Mitosis ##\nCells divide."
         assert tutor_rag.split_markdown_sections(md) == [
-            {"locator": "", "text": "Intro line.\n"},
-            {"locator": "section: Cells", "text": "# Cells\nCells are small.\n"},
+            {"locator": "", "text": "Intro line."},
+            {"locator": "section: Cells", "text": "# Cells\nCells are small."},
             {"locator": "section: Mitosis", "text": "## Mitosis ##\nCells divide."},
         ]
+
+    def test_heading_only_sections_dropped(self):
+        md = "# file.pdf\n## Contents\n## Real\nBody."
+        assert tutor_rag.split_markdown_sections(md) == [{"locator": "section: Real", "text": "## Real\nBody."}]
+
+    def test_page_headings_become_page_locators(self):
+        md = "### Page 1\nAlpha.\n### Page 2\nBeta.\n#### Mitosis\nGamma.\n## Appendix\nDelta."
+        assert [s["locator"] for s in tutor_rag.split_markdown_sections(md)] == [
+            "page 1", "page 2", "page 2, section: Mitosis", "section: Appendix"]
 
     def test_no_headings_is_one_section(self):
         assert tutor_rag.split_markdown_sections("just text") == [{"locator": "", "text": "just text"}]
@@ -329,13 +354,15 @@ class TestExtractFileSections:
             sections, reason = await tutor_rag.extract_file_sections(self._env(), FakeR2(), name)
             assert sections == [] and hint in reason
 
-    async def test_pdf_converted_with_to_markdown(self):
+    async def test_pdf_pages_located_and_metadata_dropped(self):
         env = self._env()
-        bucket = FakeR2({"slides.pdf": b"Krebs cycle overview"})
+        bucket = FakeR2({"slides.pdf": b"Krebs cycle overview\fElectron transport chain"})
         sections, reason = await tutor_rag.extract_file_sections(env, bucket, "slides.pdf")
         assert reason is None
-        assert sections[0]["locator"] == "section: Converted"
-        assert "Krebs cycle overview" in sections[0]["text"]
+        assert sections == [
+            {"locator": "page 1", "text": "### Page 1\nKrebs cycle overview"},
+            {"locator": "page 2", "text": "### Page 2\nElectron transport chain"},
+        ]
         assert env.AI.calls == [("toMarkdown", ["slides.pdf"])]
 
     async def test_conversion_error_is_reported(self):
@@ -576,6 +603,7 @@ class TestTutorEndpoints:
         assert (hit["source_type"], hit["source_id"], hit["source_title"]) == \
             ("material", "m2", "Week 3 slides")
         assert "cellular respiration" in hit["text"]
+        assert hit["locator"] == "page 1"
 
     async def test_search_cites_the_slide(self, worker, env):
         await _seed(worker, env)
