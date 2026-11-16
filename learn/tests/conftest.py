@@ -150,8 +150,18 @@ class _WebSocketRequestResponsePair:
         return MagicMock()
 
 
+class _Blob:
+    """Stub for ``js.Blob`` — keeps the parts so tests can inspect them."""
+
+    @staticmethod
+    def new(parts, options=None):
+        from types import SimpleNamespace
+        return SimpleNamespace(parts=list(parts), type=(options or {}).get("type"))
+
+
 class _JsModule:
     crypto = _Crypto()
+    Blob = _Blob()
     Uint8Array = _Uint8Array()
     WebSocketPair = _WebSocketPair()
     WebSocketRequestResponsePair = _WebSocketRequestResponsePair()

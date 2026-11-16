@@ -4866,14 +4866,24 @@ def _maybe_decrypt_factory(enc: str):
     return _decrypt
 
 
-async def _tutor_sources(env, act) -> list:
-    """Collect the course content the tutor may answer from, as plain text."""
+async def _tutor_sources(env, act):
+    """Collect the course content the tutor may answer from, as plain text.
+
+    Returns ``(sources, skipped)`` where *skipped* lists material files the
+    tutor could not read, with the reason, so the teacher can fix them.
+    """
     decrypt = _maybe_decrypt_factory(env.ENCRYPTION_KEY)
+    parts = [await decrypt(getattr(act, "description", "") or "")]
+    for label, field in (("Learning objectives", "learning_objectives"),
+                         ("Prerequisites", "prerequisites")):
+        value = await decrypt(getattr(act, field, "") or "")
+        if value:
+            parts.append(f"{label}:\n{value}")
     sources = [{
         "source_type": "activity",
         "source_id": act.id,
         "title": act.title,
-        "text": await decrypt(getattr(act, "description", "") or ""),
+        "text": "\n\n".join(p for p in parts if p),
     }]
 
     ses_res = await env.DB.prepare(
@@ -4887,18 +4897,35 @@ async def _tutor_sources(env, act) -> list:
             "text": await decrypt(s.description or ""),
         })
 
+    skipped = []
+    bucket = getattr(env, "MY_BUCKET", None)
     mat_res = await env.DB.prepare(
-        "SELECT id, title, description FROM activity_materials"
+        "SELECT id, title, description, file_r2_key, external_url FROM activity_materials"
         " WHERE activity_id=? ORDER BY display_order, created_at"
     ).bind(act.id).all()
     for m in mat_res.results or []:
+        title = await decrypt(m.title or "") or "Material"
+        parts = [await decrypt(m.description or "")]
+        if m.file_r2_key:
+            try:
+                file_text, reason = await tutor_rag.extract_file_text(env, bucket, m.file_r2_key)
+            except Exception as exc:
+                await capture_exception(exc, where="_tutor_sources.extract_file_text")
+                file_text, reason = "", "could not read file"
+            if file_text:
+                parts.append(file_text)
+            else:
+                skipped.append({"material_id": m.id, "title": title, "reason": reason})
+        elif m.external_url:
+            skipped.append({"material_id": m.id, "title": title,
+                            "reason": "external links are not fetched"})
         sources.append({
             "source_type": "material",
             "source_id": m.id,
-            "title": await decrypt(m.title or "") or "Material",
-            "text": await decrypt(m.description or ""),
+            "title": title,
+            "text": "\n\n".join(p for p in parts if p),
         })
-    return sources
+    return sources, skipped
 
 
 async def _require_tutor_access(env, user, activity_ref: str):
@@ -4930,7 +4957,8 @@ async def api_tutor_reindex(req, env, activity_ref: str):
         return err("Tutor is not configured on this deployment", 503)
 
     act_full = await env.DB.prepare(
-        "SELECT id, title, description FROM activities WHERE id=?"
+        "SELECT id, title, description, learning_objectives, prerequisites"
+        " FROM activities WHERE id=?"
     ).bind(act.id).first()
     enc = env.ENCRYPTION_KEY
 
@@ -4938,8 +4966,10 @@ async def api_tutor_reindex(req, env, activity_ref: str):
         return await encrypt_aes(text, enc)
 
     async def run():
-        sources = await _tutor_sources(env, act_full)
-        return await tutor_rag.index_activity(env, act.id, sources, _encrypt)
+        sources, skipped = await _tutor_sources(env, act_full)
+        stats = await tutor_rag.index_activity(env, act.id, sources, _encrypt)
+        stats["skipped_files"] = skipped
+        return stats
 
     try:
         stats = await _quiz_db(env, run)

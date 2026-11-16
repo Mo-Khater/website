@@ -185,6 +185,76 @@ def is_configured(env) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# File text extraction (R2 → text)
+# ---------------------------------------------------------------------------
+
+PLAIN_TEXT_TYPES = {
+    ".txt": "text/plain",
+    ".md": "text/markdown",
+    ".markdown": "text/markdown",
+}
+# Converted by Workers AI toMarkdown(). Images are deliberately excluded:
+# they go through a paid vision model and rarely carry course text.
+CONVERTIBLE_TYPES = {
+    ".pdf": "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".odt": "application/vnd.oasis.opendocument.text",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".ods": "application/vnd.oasis.opendocument.spreadsheet",
+    ".csv": "text/csv",
+    ".html": "text/html",
+    ".htm": "text/html",
+    ".xml": "application/xml",
+}
+MAX_FILE_BYTES = 10 * 1024 * 1024
+MAX_EXTRACTED_CHARS = 200_000
+
+
+def _extension(key: str) -> str:
+    name = key.rsplit("/", 1)[-1].lower()
+    return "." + name.rsplit(".", 1)[-1] if "." in name else ""
+
+
+async def extract_file_text(env, bucket, key: str):
+    """Read an R2 object and return ``(text, skip_reason)``.
+
+    Exactly one of the two is meaningful: on success ``skip_reason`` is None;
+    otherwise ``text`` is "" and ``skip_reason`` says why, so the teacher can
+    see which files the tutor cannot read.
+    """
+    key = (key or "").lstrip("/")
+    ext = _extension(key)
+    if ext not in PLAIN_TEXT_TYPES and ext not in CONVERTIBLE_TYPES:
+        return "", f"unsupported file type '{ext or 'none'}'"
+    if bucket is None:
+        return "", "file storage is not configured"
+
+    obj = await bucket.get(key)
+    if not obj:
+        return "", "file not found in storage"
+    size = int(getattr(obj, "size", 0) or 0)
+    if size > MAX_FILE_BYTES:
+        return "", f"file is larger than {MAX_FILE_BYTES // (1024 * 1024)} MB"
+    buf = await obj.arrayBuffer()
+
+    if ext in PLAIN_TEXT_TYPES:
+        text = bytes(js.Uint8Array.new(buf)).decode("utf-8", "replace")
+    else:
+        ai, _ = _bindings(env)
+        blob = js.Blob.new(to_js([buf]), _js({"type": CONVERTIBLE_TYPES[ext]}))
+        result = _py(await ai.toMarkdown(_js([{"name": key.rsplit("/", 1)[-1], "blob": blob}])))
+        doc = (result[0] if isinstance(result, list) and result else result) or {}
+        if doc.get("format") == "error":
+            return "", f"could not convert file: {str(doc.get('data') or '')[:200]}"
+        text = str(doc.get("data") or "")
+
+    text = text.strip()
+    if not text:
+        return "", "file contains no extractable text"
+    return text[:MAX_EXTRACTED_CHARS], None
+
+
 async def embed_texts(env, texts: List[str]) -> List[List[float]]:
     """Embed *texts* with Workers AI, batching to stay under request limits."""
     ai, _ = _bindings(env)

@@ -80,6 +80,37 @@ class FakeAI:
         return {"shape": [len(payload["text"]), _VOCAB],
                 "data": [_embed(t) for t in payload["text"]]}
 
+    async def toMarkdown(self, docs):
+        """Pretend conversion: a file whose bytes start with BROKEN fails."""
+        out = []
+        for d in docs:
+            raw = b"".join(d["blob"].parts).decode()
+            if raw.startswith("BROKEN"):
+                out.append({"name": d["name"], "format": "error", "data": "corrupt file"})
+            else:
+                out.append({"name": d["name"], "mimeType": d["blob"].type,
+                            "format": "markdown", "tokens": 1, "data": "# Converted\n" + raw})
+        self.calls.append(("toMarkdown", [d["name"] for d in docs]))
+        return out
+
+
+class FakeR2Object:
+    def __init__(self, data: bytes):
+        self._data = data
+        self.size = len(data)
+
+    async def arrayBuffer(self):
+        return self._data
+
+
+class FakeR2:
+    def __init__(self, files=None):
+        self.files = dict(files or {})
+
+    async def get(self, key):
+        data = self.files.get(key)
+        return FakeR2Object(data) if data is not None else None
+
 
 class FakeVectorize:
     def __init__(self):
@@ -169,6 +200,56 @@ class TestBuildChunks:
 
 
 # ---------------------------------------------------------------------------
+# File text extraction
+# ---------------------------------------------------------------------------
+
+class TestExtractFileText:
+    def _env(self):
+        return SimpleNamespace(AI=FakeAI(), VECTORIZE=FakeVectorize())
+
+    async def test_plain_text_read_directly(self):
+        env = self._env()
+        bucket = FakeR2({"notes/week1.md": b"Osmosis moves water across membranes."})
+        text, reason = await tutor_rag.extract_file_text(env, bucket, "/notes/week1.md")
+        assert (text, reason) == ("Osmosis moves water across membranes.", None)
+        assert env.AI.calls == []   # no AI call for plain text
+
+    async def test_pdf_converted_with_to_markdown(self):
+        env = self._env()
+        bucket = FakeR2({"slides.pdf": b"Krebs cycle overview"})
+        text, reason = await tutor_rag.extract_file_text(env, bucket, "slides.pdf")
+        assert reason is None
+        assert "Krebs cycle overview" in text
+        assert env.AI.calls == [("toMarkdown", ["slides.pdf"])]
+
+    async def test_conversion_error_is_reported(self):
+        bucket = FakeR2({"bad.pdf": b"BROKEN"})
+        text, reason = await tutor_rag.extract_file_text(self._env(), bucket, "bad.pdf")
+        assert text == "" and "corrupt file" in reason
+
+    async def test_images_are_skipped_without_reading(self):
+        env = self._env()
+        bucket = FakeR2({"diagram.png": b"\x89PNG"})
+        text, reason = await tutor_rag.extract_file_text(env, bucket, "diagram.png")
+        assert text == "" and "unsupported" in reason
+        assert env.AI.calls == []
+
+    async def test_missing_file(self):
+        text, reason = await tutor_rag.extract_file_text(self._env(), FakeR2(), "gone.txt")
+        assert text == "" and "not found" in reason
+
+    async def test_oversized_file(self, monkeypatch):
+        monkeypatch.setattr(tutor_rag, "MAX_FILE_BYTES", 10)
+        bucket = FakeR2({"big.txt": b"x" * 11})
+        text, reason = await tutor_rag.extract_file_text(self._env(), bucket, "big.txt")
+        assert text == "" and "larger than" in reason
+
+    async def test_no_bucket(self):
+        text, reason = await tutor_rag.extract_file_text(self._env(), None, "a.txt")
+        assert text == "" and "not configured" in reason
+
+
+# ---------------------------------------------------------------------------
 # Indexing and retrieval against the fakes
 # ---------------------------------------------------------------------------
 
@@ -180,7 +261,7 @@ def worker():
 @pytest.fixture
 async def env(worker):
     env = SimpleNamespace(
-        DB=SqliteD1(), AI=FakeAI(), VECTORIZE=FakeVectorize(),
+        DB=SqliteD1(), AI=FakeAI(), VECTORIZE=FakeVectorize(), MY_BUCKET=FakeR2(),
         ENCRYPTION_KEY="test-encryption-key", JWT_SECRET="test-jwt-secret",
     )
     await worker.init_db(env)
@@ -287,8 +368,10 @@ async def _seed(worker, env):
             " VALUES (?,?,?,?,?,?,?,?)"
         ).bind(uid, uid, uid + "@x", uid, uid, uid, "x", role).run()
     await env.DB.prepare(
-        "INSERT INTO activities (id, title, description, host_id, slug) VALUES (?,?,?,?,?)"
+        "INSERT INTO activities (id, title, description, learning_objectives, host_id, slug)"
+        " VALUES (?,?,?,?,?,?)"
     ).bind("act1", "Biology 101", await worker.encrypt_aes("Cells and how they work.", enc),
+           await worker.encrypt_aes("Explain the role of ribosomes in protein synthesis.", enc),
            "host1", "biology-101").run()
     await env.DB.prepare(
         "INSERT INTO sessions (id, activity_id, title, description, start_time) VALUES (?,?,?,?,?)"
@@ -298,6 +381,22 @@ async def _seed(worker, env):
     await env.DB.prepare(
         "INSERT INTO activity_materials (id, activity_id, title, description) VALUES (?,?,?,?)"
     ).bind("m1", "act1", "Mitosis handout", "Mitosis splits one nucleus into two identical nuclei.").run()
+    await env.DB.prepare(
+        "INSERT INTO activity_materials (id, activity_id, title, file_r2_key, display_order)"
+        " VALUES (?,?,?,?,?)"
+    ).bind("m2", "act1", "Week 3 slides", "materials/week3.pdf", 1).run()
+    await env.DB.prepare(
+        "INSERT INTO activity_materials (id, activity_id, title, file_r2_key, display_order)"
+        " VALUES (?,?,?,?,?)"
+    ).bind("m3", "act1", "Cell diagram", "materials/cell.png", 2).run()
+    await env.DB.prepare(
+        "INSERT INTO activity_materials (id, activity_id, title, external_url, display_order)"
+        " VALUES (?,?,?,?,?)"
+    ).bind("m4", "act1", "Lecture video", "https://example.com/video", 3).run()
+    env.MY_BUCKET.files["materials/week3.pdf"] = (
+        b"The mitochondria produces ATP through cellular respiration."
+    )
+    env.MY_BUCKET.files["materials/cell.png"] = b"\x89PNG"
     await env.DB.prepare(
         "INSERT INTO enrollments (id, activity_id, user_id, status) VALUES (?,?,?,?)"
     ).bind("e1", "act1", "student1", "active").run()
@@ -323,7 +422,34 @@ class TestTutorEndpoints:
         await _seed(worker, env)
         resp = await worker._dispatch(_req(worker, env, "POST", "/api/activities/act1/tutor/reindex", HOST), env)
         assert resp.status == 200, resp.body
-        assert json.loads(resp.body)["data"] == {"chunks": 3, "embedded": 3, "unchanged": 0, "removed": 0}
+        data = json.loads(resp.body)["data"]
+        # activity + session + handout + slides (the image and link have no text)
+        assert {k: data[k] for k in ("chunks", "embedded", "unchanged", "removed")} == \
+            {"chunks": 4, "embedded": 4, "unchanged": 0, "removed": 0}
+        assert sorted((f["material_id"], f["reason"]) for f in data["skipped_files"]) == [
+            ("m3", "unsupported file type '.png'"),
+            ("m4", "external links are not fetched"),
+        ]
+
+    async def _search(self, worker, env, q):
+        await worker._dispatch(_req(worker, env, "POST", "/api/activities/act1/tutor/reindex", HOST), env)
+        resp = await worker._dispatch(_req(
+            worker, env, "GET", f"/api/activities/act1/tutor/search?q={q}&k=1", STUDENT), env)
+        assert resp.status == 200, resp.body
+        return json.loads(resp.body)["data"]["results"]
+
+    async def test_file_content_is_searchable(self, worker, env):
+        await _seed(worker, env)
+        [hit] = await self._search(worker, env, "mitochondria+ATP+respiration")
+        assert (hit["source_type"], hit["source_id"], hit["source_title"]) == \
+            ("material", "m2", "Week 3 slides")
+        assert "cellular respiration" in hit["text"]
+
+    async def test_learning_objectives_are_searchable(self, worker, env):
+        await _seed(worker, env)
+        [hit] = await self._search(worker, env, "ribosomes+protein+synthesis")
+        assert hit["source_type"] == "activity"
+        assert "Learning objectives" in hit["text"]
 
     async def test_student_cannot_reindex(self, worker, env):
         await _seed(worker, env)
