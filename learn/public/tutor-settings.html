@@ -133,6 +133,7 @@
   </div>
 </main>
 
+<script src="/js/tutor-answer.js?v=1"></script>
 <script>
 (function () {
   const token = localStorage.getItem('edu_token');
@@ -151,10 +152,7 @@
   let logCursor = null;
   let tryConversation = null;
 
-  function esc(value) {
-    return String(value == null ? '' : value).replace(/[&<>"']/g, c => (
-      { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-  }
+  const esc = A1Tutor.esc;
 
   async function call(path, options) {
     const res = await fetch(api(path), Object.assign({}, options, {
@@ -255,33 +253,8 @@
     }
   });
 
-  // ------------------------------------------------- answers with sources
-  // Renders an answer with clickable [n] markers and a "where this came from" list.
-  function answerHtml(answer, citations, withText) {
-    const byN = {};
-    (citations || []).forEach(c => { byN[c.n] = c; });
-    const body = esc(answer).replace(/\[(\d{1,2})\]/g, (m, n) => byN[n]
-      ? '<sup><a href="#" class="cite text-teal-700 dark:text-teal-300 font-semibold" data-n="' + n + '">[' + n + ']</a></sup>' : m);
-    if (!citations || !citations.length) return '<p class="whitespace-pre-line">' + body + '</p>';
-    const sources = citations.map(c => {
-      const where = esc(c.source_title) + (c.locator ? ' — ' + esc(c.locator) : '');
-      const passage = withText && c.text
-        ? '<blockquote class="mt-2 pl-3 border-l-2 border-teal-400 text-gray-600 dark:text-gray-300 whitespace-pre-line">' + esc(c.text) + '</blockquote>' : '';
-      return '<details class="source" data-n="' + esc(c.n) + '"><summary class="cursor-pointer">[' + esc(c.n) + '] ' + where + '</summary>' + passage + '</details>';
-    }).join('');
-    return '<p class="whitespace-pre-line">' + body + '</p>' +
-      '<div class="mt-2 text-sm space-y-1"><p class="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">Where this came from</p>' + sources + '</div>';
-  }
-
-  // Clicking [n] opens and scrolls to that source within the same answer.
-  document.addEventListener('click', e => {
-    const link = e.target.closest('a.cite');
-    if (!link) return;
-    e.preventDefault();
-    const box = link.closest('.answer');
-    const src = box && box.querySelector('details.source[data-n="' + link.dataset.n + '"]');
-    if (src) { src.open = true; src.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); }
-  });
+  // Answers with clickable [n] sources come from the shared /js/tutor-answer.js.
+  const answerHtml = (answer, citations, withText) => A1Tutor.answerHtml(answer, citations, { withText: withText });
 
   function badge(outcome) {
     const o = OUTCOMES[outcome] || OUTCOMES.answered;
@@ -295,20 +268,20 @@
     if (!message) return;
     const item = document.createElement('div');
     item.innerHTML = '<p class="font-medium"><i class="fas fa-user mr-2 text-gray-400" aria-hidden="true"></i>' + esc(message) + '</p>' +
-      '<div class="answer mt-2 ml-6 p-3 rounded-lg bg-gray-50 dark:bg-gray-900 text-gray-500">Thinking…</div>';
+      '<div class="tutor-answer mt-2 ml-6 p-3 rounded-lg bg-gray-50 dark:bg-gray-900 text-gray-500">Thinking…</div>';
     $('try-thread').appendChild(item);
     $('try-input').value = '';
     $('try-send').disabled = true;
-    const box = item.querySelector('.answer');
+    const box = item.querySelector('.tutor-answer');
     try {
       const d = await call('/chat', { method: 'POST', body: JSON.stringify(
         Object.assign({ message: message }, tryConversation ? { conversation_id: tryConversation } : {})) });
       tryConversation = d.conversation_id;
-      box.className = 'answer mt-2 ml-6 p-3 rounded-lg bg-gray-50 dark:bg-gray-900';
+      box.className = 'tutor-answer mt-2 ml-6 p-3 rounded-lg bg-gray-50 dark:bg-gray-900';
       box.innerHTML = '<div class="mb-1">' + badge(d.outcome) + '</div>' + answerHtml(d.answer, d.citations, true);
       loadLog(true);
     } catch (err) {
-      box.className = 'answer mt-2 ml-6 p-3 rounded-lg bg-red-50 dark:bg-red-900/30 text-red-700 dark:text-red-300';
+      box.className = 'tutor-answer mt-2 ml-6 p-3 rounded-lg bg-red-50 dark:bg-red-900/30 text-red-700 dark:text-red-300';
       box.textContent = err.message;
     } finally {
       $('try-send').disabled = false;
@@ -326,7 +299,7 @@
       '<span class="font-medium text-gray-700 dark:text-gray-200">' + esc(e.student.name || 'Unknown student') + '</span>' +
       '<time datetime="' + esc(when.toISOString()) + '">' + esc(when.toLocaleString()) + '</time></div>' +
       '<p class="font-medium mb-2">' + esc(e.question) + '</p>' +
-      '<div class="answer text-gray-700 dark:text-gray-300">' + answerHtml(e.answer, e.citations, false) + '</div>' + withheld + '</li>';
+      '<div class="tutor-answer text-gray-700 dark:text-gray-300">' + answerHtml(e.answer, e.citations, false) + '</div>' + withheld + '</li>';
   }
 
   async function loadLog(reset) {
