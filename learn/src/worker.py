@@ -18,6 +18,7 @@ API Routes
   POST /api/activity-tags     – add tags to an activity      [host]
   POST /api/activities/:id/tutor/reindex – rebuild tutor index [host]
   GET  /api/activities/:id/tutor/search  – retrieve course passages (?q=&k=) [host/enrolled]
+  POST /api/activities/:id/tutor/chat    – ask the course tutor, cited answer [host/enrolled]
 
 Security model
   * ALL user PII (username, email, display name, role) is encrypted with
@@ -57,6 +58,7 @@ from pyodide.ffi import to_js
 from js import WebSocketPair, WebSocketRequestResponsePair
 import uuid
 
+import tutor_chat
 import tutor_rag
 
 _SENTRY_INITIALIZED = False
@@ -1199,6 +1201,22 @@ _DDL = [
         FOREIGN KEY (activity_id) REFERENCES activities(id) ON DELETE CASCADE
     )""",
     "CREATE INDEX IF NOT EXISTS idx_tutor_chunks_activity ON tutor_chunks(activity_id)",
+    # AI tutor: stored conversations (server-side history + teacher review log)
+    """CREATE TABLE IF NOT EXISTS tutor_messages (
+        id                TEXT PRIMARY KEY,
+        conversation_id   TEXT NOT NULL,
+        activity_id       TEXT NOT NULL,
+        user_id           TEXT NOT NULL,
+        role              TEXT NOT NULL,
+        content_encrypted TEXT NOT NULL,
+        citations_json    TEXT,
+        grounded          INTEGER,
+        created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (activity_id) REFERENCES activities(id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id)     REFERENCES users(id)      ON DELETE CASCADE
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_tutor_messages_conversation ON tutor_messages(conversation_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_tutor_messages_activity ON tutor_messages(activity_id, created_at)",
 ]
 
 
@@ -5010,6 +5028,85 @@ async def api_tutor_search(req, env, activity_ref: str):
         await capture_exception(exc, req, env, "api_tutor_search")
         return err("Search failed — please try again", 500)
     return ok({"activity_id": act.id, "query": query, "results": hits})
+
+
+async def api_tutor_chat(req, env, activity_ref: str):
+    """POST /api/activities/:id/tutor/chat — {message, conversation_id?} → cited answer.
+
+    History is loaded from the server, never taken from the client, so a
+    caller cannot plant fake assistant turns to steer the tutor.
+    """
+    user = verify_token(req.headers.get("Authorization"), env.JWT_SECRET)
+    act, error_resp = await _require_tutor_access(env, user, activity_ref)
+    if error_resp:
+        return error_resp
+    if not tutor_rag.is_configured(env):
+        return err("Tutor is not configured on this deployment", 503)
+
+    body, bad_resp = await parse_json_object(req)
+    if bad_resp:
+        return bad_resp
+    message = str(body.get("message") or "").strip()
+    if not message:
+        return err("message is required", 400)
+    if len(message) > tutor_chat.MAX_MESSAGE_CHARS:
+        return err(f"message must be at most {tutor_chat.MAX_MESSAGE_CHARS} characters", 400)
+
+    enc = env.ENCRYPTION_KEY
+    decrypt = _maybe_decrypt_factory(enc)
+    conversation_id = str(body.get("conversation_id") or "").strip()
+
+    async def load_history():
+        if not conversation_id:
+            return None
+        res = await env.DB.prepare(
+            "SELECT role, content_encrypted FROM tutor_messages"
+            " WHERE conversation_id=? AND activity_id=? AND user_id=?"
+            " ORDER BY created_at DESC, rowid DESC LIMIT ?"
+        ).bind(conversation_id, act.id, user["id"], tutor_chat.HISTORY_MESSAGES).all()
+        rows = list(reversed(res.results or []))
+        return [{"role": r.role, "content": await decrypt(r.content_encrypted)} for r in rows]
+
+    try:
+        history = await _quiz_db(env, load_history)
+    except Exception as exc:
+        await capture_exception(exc, req, env, "api_tutor_chat.history")
+        return err("Could not load the conversation — please try again", 500)
+    if conversation_id and not history:
+        return err("Conversation not found", 404)
+    if not conversation_id:
+        conversation_id = new_id()
+
+    try:
+        result = await tutor_chat.answer(env, act.id, act.title, message, history or [], decrypt)
+    except Exception as exc:
+        await capture_exception(exc, req, env, "api_tutor_chat.answer")
+        return err("The tutor is unavailable right now — please try again", 502)
+
+    stored_citations = json.dumps([{k: c[k] for k in ("n", "chunk_id", "source_type", "source_id",
+                                                        "source_title", "locator")}
+                                   for c in result["citations"]])
+    # Python None reaches D1 as JS undefined, which bind() rejects, so the
+    # user row's empty columns are SQL NULL literals rather than bound values.
+    insert = ("INSERT INTO tutor_messages (id, conversation_id, activity_id, user_id, role,"
+              " content_encrypted, citations_json, grounded, created_at) VALUES (?,?,?,?,?,?,{},"
+              "strftime('%Y-%m-%d %H:%M:%f','now'))")
+    try:
+        await env.DB.prepare(insert.format("NULL,NULL")).bind(
+            new_id(), conversation_id, act.id, user["id"], "user",
+            await encrypt_aes(message, enc)).run()
+        await env.DB.prepare(insert.format("?,?")).bind(
+            new_id(), conversation_id, act.id, user["id"], "assistant",
+            await encrypt_aes(result["answer"], enc), stored_citations, int(result["grounded"])).run()
+    except Exception as exc:
+        await capture_exception(exc, req, env, "api_tutor_chat.store")
+
+    return ok({
+        "conversation_id": conversation_id,
+        "answer": result["answer"],
+        "citations": result["citations"],
+        "grounded": result["grounded"],
+    })
 
 
 LEGACY_FEATURE_GROUPS = {
@@ -9269,11 +9366,13 @@ async def _dispatch(request, env):
         if m_act_quizzes and method == "GET":
             return await api_list_activity_quizzes(request, env, m_act_quizzes.group(1))
 
-        m_tutor = re.fullmatch(r"/api/activities/([A-Za-z0-9_-]+)/tutor/(reindex|search)", path)
+        m_tutor = re.fullmatch(r"/api/activities/([A-Za-z0-9_-]+)/tutor/(reindex|search|chat)", path)
         if m_tutor and m_tutor.group(2) == "reindex" and method == "POST":
             return await api_tutor_reindex(request, env, m_tutor.group(1))
         if m_tutor and m_tutor.group(2) == "search" and method == "GET":
             return await api_tutor_search(request, env, m_tutor.group(1))
+        if m_tutor and m_tutor.group(2) == "chat" and method == "POST":
+            return await api_tutor_chat(request, env, m_tutor.group(1))
 
         m = re.fullmatch(r"/api/activities/([A-Za-z0-9_-]+)", path)
         if m and method == "GET":

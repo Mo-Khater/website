@@ -1,18 +1,13 @@
 """
 Tests for the AI tutor retrieval layer (src/tutor_rag.py) and its endpoints.
 
-D1 is faked with a real in-memory SQLite database running the worker's own
-DDL, Workers AI with a deterministic bag-of-words embedder, and Vectorize
-with an in-memory, namespace-aware cosine index — so these tests exercise the
-real SQL and real ranking behaviour rather than scripted mock call sequences.
+Fakes (SQLite-backed D1, deterministic embedder, in-memory Vectorize and R2)
+live in tests/tutor_fakes.py, so these tests exercise real SQL and ranking
+rather than scripted mock call sequences.
 """
 
-import hashlib
 import io
 import json
-import math
-import re
-import sqlite3
 import zipfile
 from types import SimpleNamespace
 
@@ -20,132 +15,7 @@ import pytest
 
 import tutor_rag
 from tests.helpers import MockRequest, load_worker
-
-
-# ---------------------------------------------------------------------------
-# Fakes
-# ---------------------------------------------------------------------------
-
-class _Stmt:
-    def __init__(self, conn, sql, args=()):
-        self.conn, self.sql, self.args = conn, sql, args
-
-    def bind(self, *args):
-        return _Stmt(self.conn, self.sql, args)
-
-    def _rows(self):
-        cur = self.conn.execute(self.sql, self.args)
-        cols = [c[0] for c in cur.description or []]
-        return [SimpleNamespace(**dict(zip(cols, r))) for r in cur.fetchall()]
-
-    async def first(self):
-        rows = self._rows()
-        return rows[0] if rows else None
-
-    async def all(self):
-        return SimpleNamespace(results=self._rows())
-
-    async def run(self):
-        self.conn.execute(self.sql, self.args)
-        self.conn.commit()
-        return SimpleNamespace(success=True)
-
-
-class SqliteD1:
-    """Just enough of the D1 API, backed by SQLite."""
-
-    def __init__(self):
-        self.conn = sqlite3.connect(":memory:")
-
-    def prepare(self, sql):
-        return _Stmt(self.conn, sql)
-
-
-_VOCAB = 256
-
-
-def _embed(text):
-    vec = [0.0] * _VOCAB
-    for word in re.findall(r"[a-z]+", text.lower()):
-        if len(word) > 2:
-            vec[int(hashlib.md5(word.encode()).hexdigest(), 16) % _VOCAB] += 1.0
-    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
-    return [v / norm for v in vec]
-
-
-class FakeAI:
-    def __init__(self):
-        self.calls = []
-
-    async def run(self, model, payload):
-        self.calls.append((model, list(payload["text"])))
-        return {"shape": [len(payload["text"]), _VOCAB],
-                "data": [_embed(t) for t in payload["text"]]}
-
-    async def toMarkdown(self, docs):
-        """Pretend conversion: a file whose bytes start with BROKEN fails."""
-        out = []
-        for d in docs:
-            raw = b"".join(d["blob"].parts).decode()
-            if raw.startswith("BROKEN"):
-                out.append({"name": d["name"], "format": "error", "error": "corrupt file"})
-            else:
-                # Shape observed from the real service for a PDF: file-name heading,
-                # a Metadata list, an empty Contents heading, then one heading per page.
-                pages = raw.split("\f")
-                body = "\n".join(f"### Page {n}\n{text}" for n, text in enumerate(pages, start=1))
-                md = (f"# {d['name']}\n## Metadata\n- PDFFormatVersion=1.6\n- Producer=LibreOffice 7.3\n"
-                      f"## Contents\n{body}")
-                out.append({"name": d["name"], "mimetype": d["blob"].type,
-                            "format": "markdown", "tokens": 1, "data": md})
-        self.calls.append(("toMarkdown", [d["name"] for d in docs]))
-        return out
-
-
-class FakeR2Object:
-    def __init__(self, data: bytes):
-        self._data = data
-        self.size = len(data)
-
-    async def arrayBuffer(self):
-        return self._data
-
-
-class FakeR2:
-    def __init__(self, files=None):
-        self.files = dict(files or {})
-
-    async def get(self, key):
-        data = self.files.get(key)
-        return FakeR2Object(data) if data is not None else None
-
-
-class FakeVectorize:
-    def __init__(self):
-        self.vectors = {}   # (namespace, id) -> values
-
-    async def upsert(self, records):
-        for r in records:
-            self.vectors[(r["namespace"], r["id"])] = r["values"]
-        return {"mutationId": "m"}
-
-    async def deleteByIds(self, ids):
-        for key in [k for k in self.vectors if k[1] in ids]:
-            del self.vectors[key]
-        return {"mutationId": "m"}
-
-    async def query(self, vector, opts):
-        ns = opts.get("namespace")
-        scored = [
-            {"id": vid, "score": sum(a * b for a, b in zip(vector, vals))}
-            for (vns, vid), vals in self.vectors.items() if vns == ns
-        ]
-        scored.sort(key=lambda m: m["score"], reverse=True)
-        return {"count": len(scored), "matches": scored[: opts["topK"]]}
-
-
-async def _identity(text):
-    return text
+from tests.tutor_fakes import FakeAI, FakeR2, FakeVectorize, SqliteD1, _identity
 
 
 # ---------------------------------------------------------------------------
