@@ -47,6 +47,17 @@ new_sqlite_classes = ["ClassroomDO"]
 tag = "v2"
 new_sqlite_classes = ["PresenceDO"]
 
+# AI tutor (src/tutor_rag.py): Workers AI embeddings + Vectorize retrieval.
+# The tutor endpoints return 503 until both bindings exist. To enable:
+#   1. npx wrangler vectorize create learn-tutor --dimensions=768 --metric=cosine
+#   2. Uncomment the [[vectorize]] block below (deploys fail if the index is missing).
+[ai]
+binding = "AI"
+
+# [[vectorize]]
+# binding = "VECTORIZE"
+# index_name = "learn-tutor"
+
 [[r2_buckets]]
 binding = "MY_BUCKET"
 bucket_name = "alphaonelabs-production"

@@ -16,6 +16,8 @@ API Routes
   POST /api/sessions          – add a session to activity    [host]
   GET  /api/tags              – list all tags
   POST /api/activity-tags     – add tags to an activity      [host]
+  POST /api/activities/:id/tutor/reindex – rebuild tutor index [host]
+  GET  /api/activities/:id/tutor/search  – retrieve course passages (?q=&k=) [host/enrolled]
 
 Security model
   * ALL user PII (username, email, display name, role) is encrypted with
@@ -54,6 +56,8 @@ import js
 from pyodide.ffi import to_js
 from js import WebSocketPair, WebSocketRequestResponsePair
 import uuid
+
+import tutor_rag
 
 _SENTRY_INITIALIZED = False
 _SENTRY_DSN: str = ""
@@ -1179,6 +1183,21 @@ _DDL = [
         FOREIGN KEY (quiz_id) REFERENCES quizzes(id) ON DELETE CASCADE
     )""",
     "CREATE INDEX IF NOT EXISTS idx_quiz_questions_quiz ON quiz_questions(quiz_id)",
+    # AI tutor: retrievable chunks of course content (vectors live in Vectorize)
+    """CREATE TABLE IF NOT EXISTS tutor_chunks (
+        id             TEXT PRIMARY KEY,
+        activity_id    TEXT NOT NULL,
+        source_type    TEXT NOT NULL,
+        source_id      TEXT NOT NULL,
+        source_title   TEXT,
+        chunk_index    INTEGER NOT NULL DEFAULT 0,
+        text_encrypted TEXT NOT NULL,
+        content_hash   TEXT NOT NULL,
+        created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at     TEXT,
+        FOREIGN KEY (activity_id) REFERENCES activities(id) ON DELETE CASCADE
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_tutor_chunks_activity ON tutor_chunks(activity_id)",
 ]
 
 
@@ -4830,6 +4849,135 @@ async def api_delete_quiz(req, env, quiz_id: str):
 
     await _quiz_db(env, run)
     return ok(None, "Quiz deleted")
+
+
+# ---------------------------------------------------------------------------
+# AI Tutor: course-grounded retrieval (see tutor_rag.py)
+# ---------------------------------------------------------------------------
+
+def _maybe_decrypt_factory(enc: str):
+    """Decrypt values written by encrypt_aes; pass legacy plaintext through."""
+    async def _decrypt(value: str) -> str:
+        value = value or ""
+        if value.startswith("v1:"):
+            out = await decrypt_aes(value, enc)
+            return "" if out == "[decryption error]" else out
+        return value
+    return _decrypt
+
+
+async def _tutor_sources(env, act) -> list:
+    """Collect the course content the tutor may answer from, as plain text."""
+    decrypt = _maybe_decrypt_factory(env.ENCRYPTION_KEY)
+    sources = [{
+        "source_type": "activity",
+        "source_id": act.id,
+        "title": act.title,
+        "text": await decrypt(getattr(act, "description", "") or ""),
+    }]
+
+    ses_res = await env.DB.prepare(
+        "SELECT id, title, description FROM sessions WHERE activity_id=? ORDER BY start_time"
+    ).bind(act.id).all()
+    for s in ses_res.results or []:
+        sources.append({
+            "source_type": "session",
+            "source_id": s.id,
+            "title": s.title or "Session",
+            "text": await decrypt(s.description or ""),
+        })
+
+    mat_res = await env.DB.prepare(
+        "SELECT id, title, description FROM activity_materials"
+        " WHERE activity_id=? ORDER BY display_order, created_at"
+    ).bind(act.id).all()
+    for m in mat_res.results or []:
+        sources.append({
+            "source_type": "material",
+            "source_id": m.id,
+            "title": await decrypt(m.title or "") or "Material",
+            "text": await decrypt(m.description or ""),
+        })
+    return sources
+
+
+async def _require_tutor_access(env, user, activity_ref: str):
+    """Host/admin or an actively enrolled learner may query the tutor index."""
+    if not user:
+        return None, err("Authentication required", 401)
+    act = await env.DB.prepare(
+        "SELECT id, title, host_id FROM activities WHERE id=? OR slug=? LIMIT 1"
+    ).bind(activity_ref, activity_ref).first()
+    if not act:
+        return None, err("Activity not found", 404)
+    if act.host_id == user.get("id") or user.get("role") == "admin":
+        return act, None
+    enrolled = await env.DB.prepare(
+        "SELECT id FROM enrollments WHERE activity_id=? AND user_id=? AND status='active'"
+    ).bind(act.id, user.get("id")).first()
+    if not enrolled:
+        return None, err("Forbidden: enroll in this activity to use its tutor", 403)
+    return act, None
+
+
+async def api_tutor_reindex(req, env, activity_ref: str):
+    """POST /api/activities/:id/tutor/reindex — sync the activity's tutor index (host only)."""
+    user = verify_token(req.headers.get("Authorization"), env.JWT_SECRET)
+    act, error_resp = await _require_activity_host(env, user, activity_ref)
+    if error_resp:
+        return error_resp
+    if not tutor_rag.is_configured(env):
+        return err("Tutor is not configured on this deployment", 503)
+
+    act_full = await env.DB.prepare(
+        "SELECT id, title, description FROM activities WHERE id=?"
+    ).bind(act.id).first()
+    enc = env.ENCRYPTION_KEY
+
+    async def _encrypt(text: str) -> str:
+        return await encrypt_aes(text, enc)
+
+    async def run():
+        sources = await _tutor_sources(env, act_full)
+        return await tutor_rag.index_activity(env, act.id, sources, _encrypt)
+
+    try:
+        stats = await _quiz_db(env, run)
+    except Exception as exc:
+        await capture_exception(exc, req, env, "api_tutor_reindex")
+        return err("Failed to index course materials — please try again", 500)
+    return ok(stats, "Tutor index updated")
+
+
+async def api_tutor_search(req, env, activity_ref: str):
+    """GET /api/activities/:id/tutor/search?q=&k= — top course passages for a question."""
+    user = verify_token(req.headers.get("Authorization"), env.JWT_SECRET)
+    act, error_resp = await _require_tutor_access(env, user, activity_ref)
+    if error_resp:
+        return error_resp
+    if not tutor_rag.is_configured(env):
+        return err("Tutor is not configured on this deployment", 503)
+
+    params = parse_qs(urlparse(req.url).query)
+    query = (params.get("q") or [""])[0].strip()
+    if not query:
+        return err("q is required", 400)
+    try:
+        top_k = int((params.get("k") or ["5"])[0])
+    except ValueError:
+        return err("k must be an integer", 400)
+
+    decrypt = _maybe_decrypt_factory(env.ENCRYPTION_KEY)
+
+    async def run():
+        return await tutor_rag.retrieve(env, act.id, query, decrypt, top_k=top_k)
+
+    try:
+        hits = await _quiz_db(env, run)
+    except Exception as exc:
+        await capture_exception(exc, req, env, "api_tutor_search")
+        return err("Search failed — please try again", 500)
+    return ok({"activity_id": act.id, "query": query, "results": hits})
 
 
 LEGACY_FEATURE_GROUPS = {
@@ -9088,6 +9236,12 @@ async def _dispatch(request, env):
             return await api_create_quiz(request, env, m_act_quizzes.group(1))
         if m_act_quizzes and method == "GET":
             return await api_list_activity_quizzes(request, env, m_act_quizzes.group(1))
+
+        m_tutor = re.fullmatch(r"/api/activities/([A-Za-z0-9_-]+)/tutor/(reindex|search)", path)
+        if m_tutor and m_tutor.group(2) == "reindex" and method == "POST":
+            return await api_tutor_reindex(request, env, m_tutor.group(1))
+        if m_tutor and m_tutor.group(2) == "search" and method == "GET":
+            return await api_tutor_search(request, env, m_tutor.group(1))
 
         m = re.fullmatch(r"/api/activities/([A-Za-z0-9_-]+)", path)
         if m and method == "GET":

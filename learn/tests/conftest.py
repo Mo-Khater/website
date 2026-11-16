@@ -13,6 +13,10 @@ first by pytest) so that ``import worker`` succeeds in tests.
 """
 
 import sys
+from pathlib import Path
+
+# worker.py imports sibling modules from src/ (e.g. tutor_rag).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 
 # ---------------------------------------------------------------------------
