@@ -227,6 +227,8 @@ CREATE TABLE IF NOT EXISTS tutor_messages (
     content_encrypted TEXT NOT NULL,
     citations_json    TEXT,
     grounded          INTEGER,
+    outcome           TEXT,
+    withheld_encrypted TEXT,
     created_at        TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (activity_id) REFERENCES activities(id) ON DELETE CASCADE,
     FOREIGN KEY (user_id)     REFERENCES users(id)      ON DELETE CASCADE
@@ -234,3 +236,12 @@ CREATE TABLE IF NOT EXISTS tutor_messages (
 
 CREATE INDEX IF NOT EXISTS idx_tutor_messages_conversation ON tutor_messages(conversation_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_tutor_messages_activity     ON tutor_messages(activity_id, created_at);
+
+-- AI tutor teacher policy (migration 0018)
+CREATE TABLE IF NOT EXISTS tutor_policies (
+    activity_id TEXT PRIMARY KEY,
+    policy_json TEXT NOT NULL,
+    updated_by  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (activity_id) REFERENCES activities(id) ON DELETE CASCADE
+);

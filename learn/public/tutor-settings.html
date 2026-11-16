@@ -1,0 +1,382 @@
+{% extends "base.html" %}
+{% block title %}AI Tutor Settings - Alpha One Labs{% endblock %}
+{% block meta_description %}Control the AI tutor for one of your activities{% endblock %}
+{% block body_class %}min-h-screen flex flex-col bg-white text-gray-900 dark:bg-black dark:text-gray-100 transition-colors duration-300 overflow-x-hidden{% endblock %}
+{% block content %}
+<main class="flex-1 w-full">
+  <div class="max-w-4xl mx-auto px-4 md:px-6 py-10 space-y-8">
+    <div>
+      <a href="/dashboard" class="inline-flex items-center text-sm font-semibold text-teal-700 dark:text-teal-300 hover:underline mb-6">
+        <i class="fas fa-arrow-left mr-2"></i>Back to dashboard
+      </a>
+      <h1 class="text-3xl font-extrabold mb-1">AI tutor</h1>
+      <p id="page-subtitle" class="text-sm text-gray-500 dark:text-gray-400">Loading…</p>
+      <p class="text-sm text-gray-600 dark:text-gray-300 mt-3 max-w-2xl">
+        The tutor answers only from this activity's own materials and cites where each answer came from.
+        You decide whether students can use it and how it behaves. Students are told you can read their conversations.
+      </p>
+    </div>
+
+    <div id="page-error" class="hidden p-4 rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/30 text-red-700 dark:text-red-300 text-sm" role="alert"></div>
+    <div id="not-configured" class="hidden p-4 rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-900/30 text-amber-800 dark:text-amber-200 text-sm" role="status">
+      The AI tutor is not set up on this site yet (Workers AI and Vectorize bindings are missing). You can still save settings.
+    </div>
+
+    <div id="panel" class="hidden space-y-8">
+      <!-- Settings -->
+      <section class="bg-white dark:bg-gray-800 rounded-lg shadow p-6 border border-gray-100 dark:border-gray-700" aria-labelledby="settings-heading">
+        <h2 id="settings-heading" class="text-xl font-bold mb-4">Settings</h2>
+        <form id="policy-form" class="space-y-6" novalidate>
+          <label class="flex items-start gap-3 cursor-pointer">
+            <input id="p-enabled" type="checkbox" class="mt-1 h-5 w-5 rounded border-gray-300 text-teal-600">
+            <span>
+              <span class="font-medium">Students can use the tutor</span>
+              <span class="block text-sm text-gray-500 dark:text-gray-400">Off by default. You can always try it below, even while it's off.</span>
+            </span>
+          </label>
+
+          <fieldset>
+            <legend class="font-medium mb-2">How should it help?</legend>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <label class="flex items-start gap-3 p-3 rounded-lg border border-gray-200 dark:border-gray-700 cursor-pointer has-[:checked]:border-teal-500 has-[:checked]:bg-teal-50 dark:has-[:checked]:bg-teal-900/20">
+                <input type="radio" name="p-mode" value="answer" class="mt-1 text-teal-600">
+                <span><span class="font-medium">Answer questions</span>
+                  <span class="block text-sm text-gray-500 dark:text-gray-400">Explains using the course materials, with sources.</span></span>
+              </label>
+              <label class="flex items-start gap-3 p-3 rounded-lg border border-gray-200 dark:border-gray-700 cursor-pointer has-[:checked]:border-teal-500 has-[:checked]:bg-teal-50 dark:has-[:checked]:bg-teal-900/20">
+                <input type="radio" name="p-mode" value="hint_only" class="mt-1 text-teal-600">
+                <span><span class="font-medium">Hints only</span>
+                  <span class="block text-sm text-gray-500 dark:text-gray-400">Points to the right source and asks guiding questions instead of giving the answer.</span></span>
+              </label>
+            </div>
+            <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">
+              <i class="fas fa-circle-info mr-1"></i>Hints-only is an instruction to the AI. It follows it most of the time but not always, so check the review log below.
+            </p>
+          </fieldset>
+
+          <div>
+            <label class="block font-medium mb-1" for="p-topic-input">Topics the tutor must refuse</label>
+            <p class="text-sm text-gray-500 dark:text-gray-400 mb-2">Questions containing all the words of a topic are refused before the AI sees them, e.g. "final exam" or "essay".</p>
+            <ul id="p-topics" class="flex flex-wrap gap-2 mb-2" aria-live="polite"></ul>
+            <div class="flex gap-2">
+              <input id="p-topic-input" maxlength="100" placeholder="Add a topic and press Enter" class="flex-1 rounded-lg border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 px-3 py-2">
+              <button id="p-topic-add" type="button" class="px-4 py-2 rounded border border-gray-300 dark:border-gray-700 text-sm font-medium hover:bg-gray-100 dark:hover:bg-gray-700">Add</button>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+            <div>
+              <label class="block font-medium mb-1" for="p-limit">Questions per student per day</label>
+              <input id="p-limit" type="number" min="0" max="500" step="1" class="w-full rounded-lg border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 px-3 py-2">
+              <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">0 means no limit. Resets at midnight UTC.</p>
+            </div>
+            <div class="sm:col-span-2">
+              <label class="block font-medium mb-1" for="p-instructions">Extra instructions for the tutor</label>
+              <textarea id="p-instructions" rows="3" maxlength="1000" placeholder="e.g. Use simple English. Relate examples to sports." class="w-full rounded-lg border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 px-3 py-2"></textarea>
+            </div>
+          </div>
+
+          <div class="flex flex-wrap items-center gap-3">
+            <button id="policy-save" type="submit" class="bg-teal-600 hover:bg-teal-700 text-white font-medium py-2 px-5 rounded disabled:opacity-60">
+              <i class="fas fa-save mr-2"></i>Save settings
+            </button>
+            <p id="policy-status" class="text-sm" role="status" aria-live="polite"></p>
+          </div>
+        </form>
+      </section>
+
+      <!-- Materials index -->
+      <section class="bg-white dark:bg-gray-800 rounded-lg shadow p-6 border border-gray-100 dark:border-gray-700" aria-labelledby="index-heading">
+        <h2 id="index-heading" class="text-xl font-bold mb-2">Course materials</h2>
+        <p class="text-sm text-gray-600 dark:text-gray-300 mb-4">
+          The tutor reads the activity description, learning objectives, prerequisites, session descriptions and material files
+          (PDF, Word, PowerPoint, text). Update it after you change any of them. New content can take up to a minute to show up in answers.
+        </p>
+        <button id="reindex" type="button" class="bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900 font-medium py-2 px-5 rounded disabled:opacity-60">
+          <i class="fas fa-rotate mr-2"></i>Update the tutor's materials
+        </button>
+        <div id="reindex-result" class="mt-4 text-sm" role="status" aria-live="polite"></div>
+      </section>
+
+      <!-- Try it -->
+      <section class="bg-white dark:bg-gray-800 rounded-lg shadow p-6 border border-gray-100 dark:border-gray-700" aria-labelledby="try-heading">
+        <h2 id="try-heading" class="text-xl font-bold mb-2">Try it</h2>
+        <p class="text-sm text-gray-600 dark:text-gray-300 mb-4">Ask what a student might ask. This uses your saved settings. Your questions don't count toward any limit.</p>
+        <div id="try-thread" class="space-y-4 mb-4"></div>
+        <form id="try-form" class="flex gap-2" novalidate>
+          <label for="try-input" class="sr-only">Question for the tutor</label>
+          <input id="try-input" maxlength="2000" placeholder="Ask a question about this course" class="flex-1 rounded-lg border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 px-3 py-2">
+          <button id="try-send" type="submit" class="bg-teal-600 hover:bg-teal-700 text-white font-medium py-2 px-5 rounded disabled:opacity-60">Ask</button>
+        </form>
+      </section>
+
+      <!-- Review log -->
+      <section class="bg-white dark:bg-gray-800 rounded-lg shadow p-6 border border-gray-100 dark:border-gray-700" aria-labelledby="log-heading">
+        <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
+          <h2 id="log-heading" class="text-xl font-bold">Review log</h2>
+          <label class="text-sm flex items-center gap-2">Show
+            <select id="log-filter" class="rounded-lg border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 px-2 py-1">
+              <option value="">Everything</option>
+              <option value="answered">Answered</option>
+              <option value="not_found">Not in materials</option>
+              <option value="withheld">Withheld</option>
+              <option value="refused_topic">Refused topic</option>
+            </select>
+          </label>
+        </div>
+        <div id="log-stats" class="flex flex-wrap gap-2 mb-4"></div>
+        <ol id="log-list" class="space-y-3"></ol>
+        <p id="log-empty" class="hidden text-sm text-gray-500 dark:text-gray-400">No tutor conversations yet.</p>
+        <button id="log-more" type="button" class="hidden mt-4 px-4 py-2 rounded border border-gray-300 dark:border-gray-700 text-sm font-medium hover:bg-gray-100 dark:hover:bg-gray-700">Load more</button>
+      </section>
+    </div>
+  </div>
+</main>
+
+<script>
+(function () {
+  const token = localStorage.getItem('edu_token');
+  const activityId = new URLSearchParams(location.search).get('id');
+  const api = path => '/api/activities/' + encodeURIComponent(activityId) + '/tutor' + path;
+  const $ = id => document.getElementById(id);
+
+  const OUTCOMES = {
+    answered:      { label: 'Answered',         cls: 'bg-teal-100 text-teal-800 dark:bg-teal-900/40 dark:text-teal-200' },
+    not_found:     { label: 'Not in materials', cls: 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-200' },
+    withheld:      { label: 'Withheld',         cls: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200' },
+    refused_topic: { label: 'Refused topic',    cls: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-200' },
+  };
+
+  let topics = [];
+  let logCursor = null;
+  let tryConversation = null;
+
+  function esc(value) {
+    return String(value == null ? '' : value).replace(/[&<>"']/g, c => (
+      { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  async function call(path, options) {
+    const res = await fetch(api(path), Object.assign({}, options, {
+      headers: Object.assign({ Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+                             (options || {}).headers || {})
+    }));
+    let data = {};
+    try { data = await res.json(); } catch (e) { /* non-JSON error page */ }
+    if (!res.ok) throw new Error(data.error || ('Request failed (' + res.status + ')'));
+    return data.data;
+  }
+
+  function showError(msg) {
+    $('page-error').textContent = msg;
+    $('page-error').classList.remove('hidden');
+    $('page-subtitle').textContent = '';
+  }
+
+  function setStatus(el, msg, isError) {
+    el.textContent = msg;
+    el.className = 'text-sm ' + (isError ? 'text-red-600 dark:text-red-400' : 'text-gray-500 dark:text-gray-400');
+  }
+
+  // ---------------------------------------------------------------- settings
+  function renderTopics() {
+    $('p-topics').innerHTML = topics.map((t, i) =>
+      '<li class="inline-flex items-center gap-1 pl-3 pr-1 py-1 rounded-full bg-gray-100 dark:bg-gray-700 text-sm">' + esc(t) +
+      '<button type="button" data-i="' + i + '" class="topic-remove w-6 h-6 rounded-full hover:bg-gray-200 dark:hover:bg-gray-600" aria-label="Remove topic ' + esc(t) + '">' +
+      '<i class="fas fa-xmark" aria-hidden="true"></i></button></li>').join('');
+  }
+
+  function addTopic() {
+    const value = $('p-topic-input').value.replace(/\s+/g, ' ').trim();
+    if (!value) return;
+    if (!topics.some(t => t.toLowerCase() === value.toLowerCase())) topics.push(value);
+    $('p-topic-input').value = '';
+    renderTopics();
+  }
+
+  function fillPolicy(p) {
+    $('p-enabled').checked = !!p.enabled;
+    document.querySelectorAll('input[name="p-mode"]').forEach(r => { r.checked = r.value === p.mode; });
+    $('p-limit').value = p.daily_limit;
+    $('p-instructions').value = p.instructions || '';
+    topics = (p.refused_topics || []).slice();
+    renderTopics();
+  }
+
+  $('p-topic-add').addEventListener('click', addTopic);
+  $('p-topic-input').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); addTopic(); } });
+  $('p-topics').addEventListener('click', e => {
+    const btn = e.target.closest('.topic-remove');
+    if (btn) { topics.splice(Number(btn.dataset.i), 1); renderTopics(); }
+  });
+
+  $('policy-form').addEventListener('submit', async e => {
+    e.preventDefault();
+    const limit = Number($('p-limit').value);
+    if (!Number.isInteger(limit) || limit < 0 || limit > 500) {
+      setStatus($('policy-status'), 'Questions per day must be a whole number from 0 to 500.', true);
+      return;
+    }
+    const mode = (document.querySelector('input[name="p-mode"]:checked') || {}).value || 'answer';
+    $('policy-save').disabled = true;
+    setStatus($('policy-status'), 'Saving…', false);
+    try {
+      const data = await call('/policy', { method: 'PUT', body: JSON.stringify({
+        enabled: $('p-enabled').checked, mode: mode, daily_limit: limit,
+        refused_topics: topics, instructions: $('p-instructions').value
+      }) });
+      fillPolicy(data.policy);
+      setStatus($('policy-status'), 'Saved.', false);
+    } catch (err) {
+      setStatus($('policy-status'), err.message, true);
+    } finally {
+      $('policy-save').disabled = false;
+    }
+  });
+
+  // ------------------------------------------------------------------ index
+  $('reindex').addEventListener('click', async () => {
+    const out = $('reindex-result');
+    $('reindex').disabled = true;
+    out.innerHTML = '<span class="text-gray-500 dark:text-gray-400">Reading your materials… this can take a little while for big files.</span>';
+    try {
+      const d = await call('/reindex', { method: 'POST' });
+      let html = '<p class="text-teal-700 dark:text-teal-300"><i class="fas fa-check mr-1"></i>' +
+        esc(d.chunks) + ' passages ready (' + esc(d.embedded) + ' new or changed, ' + esc(d.removed) + ' removed).</p>';
+      if (d.skipped_files && d.skipped_files.length) {
+        html += '<p class="mt-3 font-medium">The tutor can\'t read these materials:</p><ul class="mt-1 list-disc pl-5 space-y-1">' +
+          d.skipped_files.map(f => '<li><span class="font-medium">' + esc(f.title) + '</span>: ' + esc(f.reason) + '</li>').join('') + '</ul>';
+      }
+      out.innerHTML = html;
+    } catch (err) {
+      out.innerHTML = '<span class="text-red-600 dark:text-red-400">' + esc(err.message) + '</span>';
+    } finally {
+      $('reindex').disabled = false;
+    }
+  });
+
+  // ------------------------------------------------- answers with sources
+  // Renders an answer with clickable [n] markers and a "where this came from" list.
+  function answerHtml(answer, citations, withText) {
+    const byN = {};
+    (citations || []).forEach(c => { byN[c.n] = c; });
+    const body = esc(answer).replace(/\[(\d{1,2})\]/g, (m, n) => byN[n]
+      ? '<sup><a href="#" class="cite text-teal-700 dark:text-teal-300 font-semibold" data-n="' + n + '">[' + n + ']</a></sup>' : m);
+    if (!citations || !citations.length) return '<p class="whitespace-pre-line">' + body + '</p>';
+    const sources = citations.map(c => {
+      const where = esc(c.source_title) + (c.locator ? ' — ' + esc(c.locator) : '');
+      const passage = withText && c.text
+        ? '<blockquote class="mt-2 pl-3 border-l-2 border-teal-400 text-gray-600 dark:text-gray-300 whitespace-pre-line">' + esc(c.text) + '</blockquote>' : '';
+      return '<details class="source" data-n="' + esc(c.n) + '"><summary class="cursor-pointer">[' + esc(c.n) + '] ' + where + '</summary>' + passage + '</details>';
+    }).join('');
+    return '<p class="whitespace-pre-line">' + body + '</p>' +
+      '<div class="mt-2 text-sm space-y-1"><p class="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400">Where this came from</p>' + sources + '</div>';
+  }
+
+  // Clicking [n] opens and scrolls to that source within the same answer.
+  document.addEventListener('click', e => {
+    const link = e.target.closest('a.cite');
+    if (!link) return;
+    e.preventDefault();
+    const box = link.closest('.answer');
+    const src = box && box.querySelector('details.source[data-n="' + link.dataset.n + '"]');
+    if (src) { src.open = true; src.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); }
+  });
+
+  function badge(outcome) {
+    const o = OUTCOMES[outcome] || OUTCOMES.answered;
+    return '<span class="inline-block px-2 py-0.5 rounded-full text-xs font-medium ' + o.cls + '">' + esc(o.label) + '</span>';
+  }
+
+  // ------------------------------------------------------------------ try it
+  $('try-form').addEventListener('submit', async e => {
+    e.preventDefault();
+    const message = $('try-input').value.trim();
+    if (!message) return;
+    const item = document.createElement('div');
+    item.innerHTML = '<p class="font-medium"><i class="fas fa-user mr-2 text-gray-400" aria-hidden="true"></i>' + esc(message) + '</p>' +
+      '<div class="answer mt-2 ml-6 p-3 rounded-lg bg-gray-50 dark:bg-gray-900 text-gray-500">Thinking…</div>';
+    $('try-thread').appendChild(item);
+    $('try-input').value = '';
+    $('try-send').disabled = true;
+    const box = item.querySelector('.answer');
+    try {
+      const d = await call('/chat', { method: 'POST', body: JSON.stringify(
+        Object.assign({ message: message }, tryConversation ? { conversation_id: tryConversation } : {})) });
+      tryConversation = d.conversation_id;
+      box.className = 'answer mt-2 ml-6 p-3 rounded-lg bg-gray-50 dark:bg-gray-900';
+      box.innerHTML = '<div class="mb-1">' + badge(d.outcome) + '</div>' + answerHtml(d.answer, d.citations, true);
+      loadLog(true);
+    } catch (err) {
+      box.className = 'answer mt-2 ml-6 p-3 rounded-lg bg-red-50 dark:bg-red-900/30 text-red-700 dark:text-red-300';
+      box.textContent = err.message;
+    } finally {
+      $('try-send').disabled = false;
+    }
+  });
+
+  // -------------------------------------------------------------- review log
+  function logEntryHtml(e) {
+    const when = new Date(e.created_at.replace(' ', 'T') + 'Z');
+    const withheld = e.withheld_text
+      ? '<details class="mt-2 text-sm"><summary class="cursor-pointer text-amber-700 dark:text-amber-300">What the AI tried to say (not shown to the student)</summary>' +
+        '<p class="mt-1 p-2 rounded bg-amber-50 dark:bg-amber-900/20 whitespace-pre-line">' + esc(e.withheld_text) + '</p></details>' : '';
+    return '<li class="p-4 rounded-lg border border-gray-200 dark:border-gray-700">' +
+      '<div class="flex flex-wrap items-center gap-2 text-sm text-gray-500 dark:text-gray-400 mb-2">' + badge(e.outcome) +
+      '<span class="font-medium text-gray-700 dark:text-gray-200">' + esc(e.student.name || 'Unknown student') + '</span>' +
+      '<time datetime="' + esc(when.toISOString()) + '">' + esc(when.toLocaleString()) + '</time></div>' +
+      '<p class="font-medium mb-2">' + esc(e.question) + '</p>' +
+      '<div class="answer text-gray-700 dark:text-gray-300">' + answerHtml(e.answer, e.citations, false) + '</div>' + withheld + '</li>';
+  }
+
+  async function loadLog(reset) {
+    if (reset) { logCursor = null; $('log-list').innerHTML = ''; }
+    const params = new URLSearchParams({ limit: '20' });
+    if ($('log-filter').value) params.set('outcome', $('log-filter').value);
+    if (logCursor) params.set('before', logCursor);
+    try {
+      const d = await call('/log?' + params.toString());
+      $('log-stats').innerHTML = Object.keys(OUTCOMES).map(k =>
+        '<span class="inline-flex items-center gap-1 px-2 py-1 rounded-full text-xs font-medium ' + OUTCOMES[k].cls + '">' +
+        esc(OUTCOMES[k].label) + ': ' + esc(d.stats[k] || 0) + '</span>').join('');
+      $('log-list').insertAdjacentHTML('beforeend', d.entries.map(logEntryHtml).join(''));
+      logCursor = d.next_before;
+      $('log-more').classList.toggle('hidden', !logCursor);
+      $('log-empty').classList.toggle('hidden', $('log-list').children.length > 0);
+    } catch (err) {
+      $('log-list').innerHTML = '<li class="text-sm text-red-600 dark:text-red-400">' + esc(err.message) + '</li>';
+    }
+  }
+
+  $('log-filter').addEventListener('change', () => loadLog(true));
+  $('log-more').addEventListener('click', () => loadLog(false));
+
+  // -------------------------------------------------------------------- init
+  async function init() {
+    if (!token) {
+      sessionStorage.setItem('post_login_redirect', '/tutor-settings' + location.search);
+      window.location.href = '/login';
+      return;
+    }
+    if (!activityId) { showError('No activity was specified.'); return; }
+    try {
+      const [activityRes, policy, status] = await Promise.all([
+        fetch('/api/activities/' + encodeURIComponent(activityId), { headers: { Authorization: 'Bearer ' + token } })
+          .then(r => r.json()),
+        call('/policy'),
+        call(''),
+      ]);
+      $('page-subtitle').textContent = (activityRes.activity && activityRes.activity.title) || '';
+      $('not-configured').classList.toggle('hidden', status.configured);
+      fillPolicy(policy.policy);
+      $('panel').classList.remove('hidden');
+      loadLog(true);
+    } catch (err) {
+      showError(/host/i.test(err.message) ? 'Only the host of this activity can manage its tutor.' : err.message);
+    }
+  }
+
+  init();
+})();
+</script>
+{% endblock %}

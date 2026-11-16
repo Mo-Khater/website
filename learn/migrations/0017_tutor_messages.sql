@@ -12,6 +12,8 @@ CREATE TABLE IF NOT EXISTS tutor_messages (
     content_encrypted TEXT NOT NULL,
     citations_json    TEXT,
     grounded          INTEGER,
+    outcome           TEXT,
+    withheld_encrypted TEXT,
     created_at        TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (activity_id) REFERENCES activities(id) ON DELETE CASCADE,
     FOREIGN KEY (user_id)     REFERENCES users(id)      ON DELETE CASCADE

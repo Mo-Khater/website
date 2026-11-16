@@ -19,6 +19,10 @@ API Routes
   POST /api/activities/:id/tutor/reindex – rebuild tutor index [host]
   GET  /api/activities/:id/tutor/search  – retrieve course passages (?q=&k=) [host/enrolled]
   POST /api/activities/:id/tutor/chat    – ask the course tutor, cited answer [host/enrolled]
+  GET  /api/activities/:id/tutor         – tutor status for the caller   [host/enrolled]
+  GET  /api/activities/:id/tutor/policy  – teacher policy                [host]
+  PUT  /api/activities/:id/tutor/policy  – update teacher policy         [host]
+  GET  /api/activities/:id/tutor/log     – review log of tutor answers   [host]
 
 Security model
   * ALL user PII (username, email, display name, role) is encrypted with
@@ -59,6 +63,7 @@ from js import WebSocketPair, WebSocketRequestResponsePair
 import uuid
 
 import tutor_chat
+import tutor_policy
 import tutor_rag
 
 _SENTRY_INITIALIZED = False
@@ -1211,12 +1216,22 @@ _DDL = [
         content_encrypted TEXT NOT NULL,
         citations_json    TEXT,
         grounded          INTEGER,
+        outcome           TEXT,
+        withheld_encrypted TEXT,
         created_at        TEXT NOT NULL DEFAULT (datetime('now')),
         FOREIGN KEY (activity_id) REFERENCES activities(id) ON DELETE CASCADE,
         FOREIGN KEY (user_id)     REFERENCES users(id)      ON DELETE CASCADE
     )""",
     "CREATE INDEX IF NOT EXISTS idx_tutor_messages_conversation ON tutor_messages(conversation_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_tutor_messages_activity ON tutor_messages(activity_id, created_at)",
+    # AI tutor: teacher policy (JSON, see tutor_policy.py)
+    """CREATE TABLE IF NOT EXISTS tutor_policies (
+        activity_id TEXT PRIMARY KEY,
+        policy_json TEXT NOT NULL,
+        updated_by  TEXT NOT NULL,
+        updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (activity_id) REFERENCES activities(id) ON DELETE CASCADE
+    )""",
 ]
 
 
@@ -5043,6 +5058,20 @@ async def api_tutor_chat(req, env, activity_ref: str):
     if not tutor_rag.is_configured(env):
         return err("Tutor is not configured on this deployment", 503)
 
+    is_host = _is_activity_host(act, user)
+    try:
+        policy = await _quiz_db(env, lambda: _load_tutor_policy(env, act.id))
+        used_today = await _tutor_questions_today(env, act.id, user["id"])
+    except Exception as exc:
+        await capture_exception(exc, req, env, "api_tutor_chat.policy")
+        return err("Could not load the tutor settings — please try again", 500)
+    # Hosts can always preview their tutor; students need it switched on.
+    if not is_host and not policy["enabled"]:
+        return err("The tutor is not turned on for this course", 403)
+    if not is_host and policy["daily_limit"] and used_today >= policy["daily_limit"]:
+        return err(f"You've reached today's limit of {policy['daily_limit']} tutor questions. "
+                   "It resets at midnight UTC.", 429)
+
     body, bad_resp = await parse_json_object(req)
     if bad_resp:
         return bad_resp
@@ -5078,7 +5107,7 @@ async def api_tutor_chat(req, env, activity_ref: str):
         conversation_id = new_id()
 
     try:
-        result = await tutor_chat.answer(env, act.id, act.title, message, history or [], decrypt)
+        result = await tutor_chat.answer(env, act.id, act.title, message, history or [], decrypt, policy)
     except Exception as exc:
         await capture_exception(exc, req, env, "api_tutor_chat.answer")
         return err("The tutor is unavailable right now — please try again", 502)
@@ -5089,15 +5118,17 @@ async def api_tutor_chat(req, env, activity_ref: str):
     # Python None reaches D1 as JS undefined, which bind() rejects, so the
     # user row's empty columns are SQL NULL literals rather than bound values.
     insert = ("INSERT INTO tutor_messages (id, conversation_id, activity_id, user_id, role,"
-              " content_encrypted, citations_json, grounded, created_at) VALUES (?,?,?,?,?,?,{},"
-              "strftime('%Y-%m-%d %H:%M:%f','now'))")
+              " content_encrypted, citations_json, grounded, outcome, withheld_encrypted, created_at)"
+              " VALUES (?,?,?,?,?,?,{},strftime('%Y-%m-%d %H:%M:%f','now'))")
+    withheld = result.get("withheld_text") or ""
     try:
-        await env.DB.prepare(insert.format("NULL,NULL")).bind(
+        await env.DB.prepare(insert.format("NULL,NULL,NULL,NULL")).bind(
             new_id(), conversation_id, act.id, user["id"], "user",
             await encrypt_aes(message, enc)).run()
-        await env.DB.prepare(insert.format("?,?")).bind(
+        await env.DB.prepare(insert.format("?,?,?," + ("?" if withheld else "NULL"))).bind(
             new_id(), conversation_id, act.id, user["id"], "assistant",
-            await encrypt_aes(result["answer"], enc), stored_citations, int(result["grounded"])).run()
+            await encrypt_aes(result["answer"], enc), stored_citations, int(result["grounded"]),
+            result["outcome"], *([await encrypt_aes(withheld, enc)] if withheld else [])).run()
     except Exception as exc:
         await capture_exception(exc, req, env, "api_tutor_chat.store")
 
@@ -5106,6 +5137,185 @@ async def api_tutor_chat(req, env, activity_ref: str):
         "answer": result["answer"],
         "citations": result["citations"],
         "grounded": result["grounded"],
+        "outcome": result["outcome"],
+    })
+
+
+def _is_activity_host(act, user) -> bool:
+    return bool(user) and (act.host_id == user.get("id") or user.get("role") == "admin")
+
+
+async def _load_tutor_policy(env, activity_id: str) -> dict:
+    row = await env.DB.prepare(
+        "SELECT policy_json FROM tutor_policies WHERE activity_id=?"
+    ).bind(activity_id).first()
+    stored = {}
+    if row and row.policy_json:
+        try:
+            stored = json.loads(row.policy_json)
+        except ValueError:
+            stored = {}
+    return tutor_policy.normalize(stored if isinstance(stored, dict) else {})
+
+
+async def _tutor_questions_today(env, activity_id: str, user_id: str) -> int:
+    """Questions this user asked this activity's tutor since midnight UTC."""
+    row = await env.DB.prepare(
+        "SELECT COUNT(*) AS n FROM tutor_messages"
+        " WHERE activity_id=? AND user_id=? AND role='user' AND created_at >= date('now')"
+    ).bind(activity_id, user_id).first()
+    return int(row.n) if row else 0
+
+
+async def api_tutor_status(req, env, activity_ref: str):
+    """GET /api/activities/:id/tutor — what the caller can do with this tutor."""
+    user = verify_token(req.headers.get("Authorization"), env.JWT_SECRET)
+    act, error_resp = await _require_tutor_access(env, user, activity_ref)
+    if error_resp:
+        return error_resp
+
+    async def run():
+        return (await _load_tutor_policy(env, act.id),
+                await _tutor_questions_today(env, act.id, user["id"]))
+
+    policy, used = await _quiz_db(env, run)
+    is_host = _is_activity_host(act, user)
+    limit = policy["daily_limit"]
+    return ok({
+        "configured": tutor_rag.is_configured(env),
+        "enabled": policy["enabled"],
+        "available": tutor_rag.is_configured(env) and (policy["enabled"] or is_host),
+        "is_host": is_host,
+        "mode": policy["mode"],
+        "daily_limit": limit,
+        "used_today": used,
+        "remaining_today": None if (is_host or not limit) else max(0, limit - used),
+        "notice": tutor_policy.STUDENT_NOTICE,
+    })
+
+
+async def api_tutor_get_policy(req, env, activity_ref: str):
+    """GET /api/activities/:id/tutor/policy — the teacher's tutor settings (host only)."""
+    user = verify_token(req.headers.get("Authorization"), env.JWT_SECRET)
+    act, error_resp = await _require_activity_host(env, user, activity_ref)
+    if error_resp:
+        return error_resp
+    policy = await _quiz_db(env, lambda: _load_tutor_policy(env, act.id))
+    return ok({"activity_id": act.id, "policy": policy, "limits": {
+        "max_topics": tutor_policy.MAX_TOPICS,
+        "max_topic_chars": tutor_policy.MAX_TOPIC_CHARS,
+        "max_instructions_chars": tutor_policy.MAX_INSTRUCTIONS_CHARS,
+        "max_daily_limit": tutor_policy.MAX_DAILY_LIMIT,
+        "modes": list(tutor_policy.MODES),
+    }})
+
+
+async def api_tutor_put_policy(req, env, activity_ref: str):
+    """PUT /api/activities/:id/tutor/policy — update any subset of the settings (host only)."""
+    user = verify_token(req.headers.get("Authorization"), env.JWT_SECRET)
+    act, error_resp = await _require_activity_host(env, user, activity_ref)
+    if error_resp:
+        return error_resp
+    body, bad_resp = await parse_json_object(req)
+    if bad_resp:
+        return bad_resp
+
+    async def run():
+        current = await _load_tutor_policy(env, act.id)
+        policy, problem = tutor_policy.validate_update(current, body)
+        if problem:
+            return None, problem
+        await env.DB.prepare(
+            "INSERT INTO tutor_policies (activity_id, policy_json, updated_by, updated_at)"
+            " VALUES (?,?,?,datetime('now'))"
+            " ON CONFLICT(activity_id) DO UPDATE SET policy_json=excluded.policy_json,"
+            " updated_by=excluded.updated_by, updated_at=excluded.updated_at"
+        ).bind(act.id, json.dumps(policy), user["id"]).run()
+        return policy, ""
+
+    policy, problem = await _quiz_db(env, run)
+    if problem:
+        return err(problem, 400)
+    return ok({"activity_id": act.id, "policy": policy}, "Tutor settings saved")
+
+
+_TUTOR_OUTCOMES = ("answered", "not_found", "withheld", "refused_topic")
+
+
+async def api_tutor_log(req, env, activity_ref: str):
+    """GET /api/activities/:id/tutor/log?limit=&before=&outcome=&student= — review log (host only).
+
+    One entry per tutor answer, newest first, with the student's question,
+    the answer, its citations and outcome, and any withheld model text.
+    Paging: pass the previous page's ``next_before`` as ``before``. It is the
+    row's insert sequence, not a timestamp, so entries created in the same
+    millisecond are never skipped.
+    """
+    user = verify_token(req.headers.get("Authorization"), env.JWT_SECRET)
+    act, error_resp = await _require_activity_host(env, user, activity_ref)
+    if error_resp:
+        return error_resp
+
+    params = parse_qs(urlparse(req.url).query)
+    arg = lambda name: (params.get(name) or [""])[0].strip()
+    try:
+        limit = max(1, min(int(arg("limit") or 50), 100))
+    except ValueError:
+        return err("limit must be an integer", 400)
+    outcome = arg("outcome")
+    if outcome and outcome not in _TUTOR_OUTCOMES:
+        return err(f"outcome must be one of: {', '.join(_TUTOR_OUTCOMES)}", 400)
+    before = arg("before")
+    if before and not before.isdigit():
+        return err("before must be the next_before value from a previous page", 400)
+
+    where, binds = ["a.activity_id=?", "a.role='assistant'"], [act.id]
+    for clause, value in (("a.outcome=?", outcome), ("a.rowid<?", int(before) if before else None),
+                          ("a.user_id=?", arg("student"))):
+        if value:
+            where.append(clause)
+            binds.append(value)
+    decrypt = _maybe_decrypt_factory(env.ENCRYPTION_KEY)
+
+    async def run():
+        rows = await env.DB.prepare(
+            "SELECT a.rowid AS seq, a.id, a.conversation_id, a.user_id, a.created_at, a.content_encrypted,"
+            " a.citations_json, a.outcome, a.withheld_encrypted, u.name AS student_name,"
+            " (SELECT q.content_encrypted FROM tutor_messages q"
+            "   WHERE q.conversation_id=a.conversation_id AND q.role='user' AND q.rowid < a.rowid"
+            "   ORDER BY q.rowid DESC LIMIT 1) AS question_encrypted"
+            " FROM tutor_messages a LEFT JOIN users u ON u.id=a.user_id"
+            f" WHERE {' AND '.join(where)} ORDER BY a.rowid DESC LIMIT ?"
+        ).bind(*binds, limit).all()
+        stats = await env.DB.prepare(
+            "SELECT outcome, COUNT(*) AS n FROM tutor_messages"
+            " WHERE activity_id=? AND role='assistant' GROUP BY outcome"
+        ).bind(act.id).all()
+        return rows.results or [], stats.results or []
+
+    rows, stats = await _quiz_db(env, run)
+    entries = []
+    next_before = str(rows[-1].seq) if len(rows) == limit else None
+    for r in rows:
+        try:
+            citations = json.loads(r.citations_json or "[]")
+        except ValueError:
+            citations = []
+        entries.append({
+            "id": r.id,
+            "conversation_id": r.conversation_id,
+            "created_at": r.created_at,
+            "student": {"id": r.user_id, "name": await decrypt(r.student_name or "")},
+            "question": await decrypt(r.question_encrypted or ""),
+            "answer": await decrypt(r.content_encrypted or ""),
+            "outcome": r.outcome or "answered",
+            "citations": citations,
+            "withheld_text": await decrypt(r.withheld_encrypted) if r.withheld_encrypted else None,
+        })
+    return ok({
+        "entries": entries,
+        "next_before": next_before,
+        "stats": {o: 0 for o in _TUTOR_OUTCOMES} | {(s.outcome or "answered"): s.n for s in stats},
     })
 
 
@@ -5278,6 +5488,7 @@ BLOG_RECORD_MODELS = {"web.BlogPost"}
 STATIC_CLEAN_ROUTES = {
     "/activity": "/activity.html",
     "/edit-activity": "/edit-activity.html",
+    "/tutor-settings": "/tutor-settings.html",
     "/classes-map": "/classes-map.html",
     "/requests": "/requests.html",
     "/waiting-rooms": "/waiting-rooms.html",
@@ -9366,13 +9577,22 @@ async def _dispatch(request, env):
         if m_act_quizzes and method == "GET":
             return await api_list_activity_quizzes(request, env, m_act_quizzes.group(1))
 
-        m_tutor = re.fullmatch(r"/api/activities/([A-Za-z0-9_-]+)/tutor/(reindex|search|chat)", path)
+        m_tutor_status = re.fullmatch(r"/api/activities/([A-Za-z0-9_-]+)/tutor", path)
+        if m_tutor_status and method == "GET":
+            return await api_tutor_status(request, env, m_tutor_status.group(1))
+        m_tutor = re.fullmatch(r"/api/activities/([A-Za-z0-9_-]+)/tutor/(reindex|search|chat|policy|log)", path)
         if m_tutor and m_tutor.group(2) == "reindex" and method == "POST":
             return await api_tutor_reindex(request, env, m_tutor.group(1))
         if m_tutor and m_tutor.group(2) == "search" and method == "GET":
             return await api_tutor_search(request, env, m_tutor.group(1))
         if m_tutor and m_tutor.group(2) == "chat" and method == "POST":
             return await api_tutor_chat(request, env, m_tutor.group(1))
+        if m_tutor and m_tutor.group(2) == "policy" and method == "GET":
+            return await api_tutor_get_policy(request, env, m_tutor.group(1))
+        if m_tutor and m_tutor.group(2) == "policy" and method == "PUT":
+            return await api_tutor_put_policy(request, env, m_tutor.group(1))
+        if m_tutor and m_tutor.group(2) == "log" and method == "GET":
+            return await api_tutor_log(request, env, m_tutor.group(1))
 
         m = re.fullmatch(r"/api/activities/([A-Za-z0-9_-]+)", path)
         if m and method == "GET":

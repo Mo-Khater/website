@@ -134,6 +134,9 @@ async def env(worker, monkeypatch):
         ).bind(f"e{i}", "act1", uid, "active").run()
     resp = await worker._dispatch(_req(worker, env, "POST", "/api/activities/act1/tutor/reindex", "host1"), env)
     assert resp.status == 200, resp.body
+    resp = await worker._dispatch(_req(worker, env, "PUT", "/api/activities/act1/tutor/policy", "host1",
+                                       {"enabled": True}), env)
+    assert resp.status == 200, resp.body
     return env
 
 
@@ -205,7 +208,8 @@ class TestChatEndpoint:
         status, body = await _chat(worker, env, "student1", "Explain quantum entanglement of spaceships")
         assert status == 200
         assert body["data"] == {"conversation_id": body["data"]["conversation_id"],
-                                "answer": tutor_chat.NOT_FOUND_ANSWER, "citations": [], "grounded": False}
+                                "answer": tutor_chat.NOT_FOUND_ANSWER, "citations": [], "grounded": False,
+                                "outcome": "not_found"}
         assert env.AI.chat_calls == []
 
     async def test_invented_citation_only_is_withheld(self, worker, env):
