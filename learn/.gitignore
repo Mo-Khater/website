@@ -39,3 +39,7 @@ legacy-site-source/
 .env.production
 .secrets/
 *447605*.json
+
+# AI tutor eval (tutor_eval/run_eval.py)
+.tutor-eval-state.json
+tutor-eval-report.json

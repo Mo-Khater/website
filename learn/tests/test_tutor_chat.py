@@ -212,6 +212,17 @@ class TestChatEndpoint:
                                 "outcome": "not_found"}
         assert env.AI.chat_calls == []
 
+    async def test_model_says_not_in_course(self, worker, env):
+        # Seen in the eval: refusals cited "[1] to [5]" and were logged as answers.
+        env.AI.chat_responder = lambda msgs: "NOT_IN_COURSE"
+        _, body = await _chat(worker, env, "student1", "How do plants capture sunlight with CRISPR?")
+        assert env.AI.chat_calls
+        assert body["data"]["outcome"] == "not_found"
+        assert body["data"]["answer"] == tutor_chat.NOT_FOUND_ANSWER
+        assert body["data"]["citations"] == []
+        system = env.AI.chat_calls[0][1]["messages"][0]["content"]
+        assert "reply with exactly NOT_IN_COURSE" in system
+
     async def test_invented_citation_only_is_withheld(self, worker, env):
         env.AI.chat_responder = lambda msgs: "Plants are green because of magic [4]."
         _, body = await _chat(worker, env, "student1", "How do plants capture sunlight?")
