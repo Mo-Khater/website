@@ -1190,6 +1190,7 @@ _DDL = [
         source_type    TEXT NOT NULL,
         source_id      TEXT NOT NULL,
         source_title   TEXT,
+        locator        TEXT,
         chunk_index    INTEGER NOT NULL DEFAULT 0,
         text_encrypted TEXT NOT NULL,
         content_hash   TEXT NOT NULL,
@@ -4873,17 +4874,18 @@ async def _tutor_sources(env, act):
     tutor could not read, with the reason, so the teacher can fix them.
     """
     decrypt = _maybe_decrypt_factory(env.ENCRYPTION_KEY)
-    parts = [await decrypt(getattr(act, "description", "") or "")]
+    sections = [{"locator": "description",
+                 "text": await decrypt(getattr(act, "description", "") or "")}]
     for label, field in (("Learning objectives", "learning_objectives"),
                          ("Prerequisites", "prerequisites")):
         value = await decrypt(getattr(act, field, "") or "")
         if value:
-            parts.append(f"{label}:\n{value}")
+            sections.append({"locator": label.lower(), "text": f"{label}:\n{value}"})
     sources = [{
         "source_type": "activity",
         "source_id": act.id,
         "title": act.title,
-        "text": "\n\n".join(p for p in parts if p),
+        "sections": sections,
     }]
 
     ses_res = await env.DB.prepare(
@@ -4905,15 +4907,15 @@ async def _tutor_sources(env, act):
     ).bind(act.id).all()
     for m in mat_res.results or []:
         title = await decrypt(m.title or "") or "Material"
-        parts = [await decrypt(m.description or "")]
+        sections = [{"locator": "description", "text": await decrypt(m.description or "")}]
         if m.file_r2_key:
             try:
-                file_text, reason = await tutor_rag.extract_file_text(env, bucket, m.file_r2_key)
+                file_sections, reason = await tutor_rag.extract_file_sections(env, bucket, m.file_r2_key)
             except Exception as exc:
-                await capture_exception(exc, where="_tutor_sources.extract_file_text")
-                file_text, reason = "", "could not read file"
-            if file_text:
-                parts.append(file_text)
+                await capture_exception(exc, where="_tutor_sources.extract_file_sections")
+                file_sections, reason = [], "could not read file"
+            if file_sections:
+                sections.extend(file_sections)
             else:
                 skipped.append({"material_id": m.id, "title": title, "reason": reason})
         elif m.external_url:
@@ -4923,7 +4925,7 @@ async def _tutor_sources(env, act):
             "source_type": "material",
             "source_id": m.id,
             "title": title,
-            "text": "\n\n".join(p for p in parts if p),
+            "sections": sections,
         })
     return sources, skipped
 

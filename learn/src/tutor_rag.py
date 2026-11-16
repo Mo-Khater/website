@@ -15,12 +15,22 @@ Storage
     rest of learn's course content) plus a content hash used to skip
     re-embedding chunks that have not changed.
 
+Citations
+  Every chunk records its source (type, id, title) and a *locator* inside
+  that source — "slide 7", "page 3", "section: Photosynthesis" — so the tutor
+  can say exactly where an answer came from. A chunk never spans two
+  sections, so its locator is always accurate.
+
 Embeddings come from Workers AI (binding ``AI``).
 """
 
 import hashlib
+import io
+import posixpath
 import re
-from typing import Any, Awaitable, Callable, Dict, List
+import zipfile
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from xml.etree import ElementTree
 
 import js
 from pyodide.ffi import to_js
@@ -109,21 +119,32 @@ def chunk_id(activity_id: str, source_type: str, source_id: str, index: int) -> 
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:48]
 
 
-def content_hash(source_title: str, text: str) -> str:
-    """Hash of everything that affects the embedding, including the model."""
-    raw = f"{EMBED_MODEL}\n{source_title}\n{text}"
+def content_hash(source_title: str, locator: str, text: str) -> str:
+    """Hash of everything stored or embedded for a chunk, including the model."""
+    raw = f"{EMBED_MODEL}\n{source_title}\n{locator}\n{text}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def embedding_input(source_title: str, text: str) -> str:
-    """Prefix the chunk with its source title so short chunks keep context."""
-    return f"{source_title}\n{text}" if source_title else text
+def embedding_input(source_title: str, locator: str, text: str) -> str:
+    """Prefix the chunk with where it comes from so short chunks keep context."""
+    header = " — ".join(p for p in (source_title, locator) if p)
+    return f"{header}\n{text}" if header else text
+
+
+def source_sections(src: Dict[str, Any]) -> List[Dict[str, str]]:
+    """A source is either ``{"text": ...}`` or ``{"sections": [{"locator", "text"}]}``."""
+    if src.get("sections") is not None:
+        return [{"locator": str(sec.get("locator") or "")[:120], "text": str(sec.get("text") or "")}
+                for sec in src["sections"]]
+    return [{"locator": "", "text": str(src.get("text") or "")}]
 
 
 def build_chunks(activity_id: str, sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Turn source documents into chunk records.
 
-    Each source is ``{"source_type", "source_id", "title", "text"}``.
+    Each source is ``{"source_type", "source_id", "title"}`` plus either
+    ``"text"`` or ``"sections"`` (see :func:`source_sections`). Chunks are
+    numbered across the whole source, so ids stay unique.
     """
     out: List[Dict[str, Any]] = []
     for src in sources:
@@ -132,19 +153,24 @@ def build_chunks(activity_id: str, sources: List[Dict[str, Any]]) -> List[Dict[s
             raise ValueError(f"unknown source_type: {source_type!r}")
         source_id = str(src.get("source_id") or "")
         title = str(src.get("title") or "").strip()[:200]
-        for index, piece in enumerate(chunk_text(str(src.get("text") or ""))):
-            out.append({
-                "id": chunk_id(activity_id, source_type, source_id, index),
-                "activity_id": activity_id,
-                "source_type": source_type,
-                "source_id": source_id,
-                "source_title": title,
-                "chunk_index": index,
-                "text": piece,
-                "content_hash": content_hash(title, piece),
-            })
-            if len(out) >= MAX_CHUNKS_PER_ACTIVITY:
-                return out
+        index = 0
+        for section in source_sections(src):
+            locator = section["locator"]
+            for piece in chunk_text(section["text"]):
+                out.append({
+                    "id": chunk_id(activity_id, source_type, source_id, index),
+                    "activity_id": activity_id,
+                    "source_type": source_type,
+                    "source_id": source_id,
+                    "source_title": title,
+                    "locator": locator,
+                    "chunk_index": index,
+                    "text": piece,
+                    "content_hash": content_hash(title, locator, piece),
+                })
+                index += 1
+                if len(out) >= MAX_CHUNKS_PER_ACTIVITY:
+                    return out
     return out
 
 
@@ -186,16 +212,17 @@ def is_configured(env) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# File text extraction (R2 → text)
+# File text extraction (R2 → located sections)
 # ---------------------------------------------------------------------------
 
-PLAIN_TEXT_TYPES = {
-    ".txt": "text/plain",
-    ".md": "text/markdown",
-    ".markdown": "text/markdown",
-}
-# Converted by Workers AI toMarkdown(). Images are deliberately excluded:
-# they go through a paid vision model and rarely carry course text.
+Sections = List[Dict[str, str]]
+
+PLAIN_TEXT_TYPES = {".txt": "text/plain"}
+MARKDOWN_TYPES = {".md": "text/markdown", ".markdown": "text/markdown"}
+PPTX_TYPE = ".pptx"
+# Converted by Workers AI toMarkdown() (no PowerPoint support there, hence our
+# own .pptx parser). Images are deliberately excluded: they go through a paid
+# vision model and rarely carry course text.
 CONVERTIBLE_TYPES = {
     ".pdf": "application/pdf",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -207,8 +234,17 @@ CONVERTIBLE_TYPES = {
     ".htm": "text/html",
     ".xml": "application/xml",
 }
+SAVE_AS_HINTS = {
+    ".ppt": "old PowerPoint format — save it as .pptx or PDF",
+    ".odp": "OpenDocument slides are not supported — save as .pptx or PDF",
+    ".doc": "old Word format — save it as .docx or PDF",
+}
 MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_EXTRACTED_CHARS = 200_000
+MAX_PPTX_XML_BYTES = 20 * 1024 * 1024   # uncompressed; guards against zip bombs
+MAX_SLIDES = 500
+
+_HEADING_RE = re.compile(r"^#{1,6}\s+(.+?)\s*#*\s*$")
 
 
 def _extension(key: str) -> str:
@@ -216,43 +252,158 @@ def _extension(key: str) -> str:
     return "." + name.rsplit(".", 1)[-1] if "." in name else ""
 
 
-async def extract_file_text(env, bucket, key: str):
-    """Read an R2 object and return ``(text, skip_reason)``.
+def _cap_sections(sections: Sections, limit: Optional[int] = None) -> Sections:
+    """Drop empty sections and truncate the total text to *limit* characters."""
+    out: Sections = []
+    remaining = MAX_EXTRACTED_CHARS if limit is None else limit
+    for sec in sections:
+        text = (sec.get("text") or "").strip()
+        if not text or remaining <= 0:
+            continue
+        out.append({"locator": sec.get("locator") or "", "text": text[:remaining]})
+        remaining -= len(text)
+    return out
 
-    Exactly one of the two is meaningful: on success ``skip_reason`` is None;
-    otherwise ``text`` is "" and ``skip_reason`` says why, so the teacher can
-    see which files the tutor cannot read.
+
+def split_markdown_sections(markdown: str) -> Sections:
+    """Split Markdown at headings; each section is located by its heading."""
+    sections: Sections = []
+    locator, lines = "", []
+    for line in (markdown or "").replace("\r\n", "\n").split("\n"):
+        m = _HEADING_RE.match(line.strip())
+        if m:
+            if "\n".join(lines).strip():
+                sections.append({"locator": locator, "text": "\n".join(lines)})
+            locator, lines = f"section: {m.group(1)[:80]}", [line]
+        else:
+            lines.append(line)
+    if "\n".join(lines).strip():
+        sections.append({"locator": locator, "text": "\n".join(lines)})
+    return sections
+
+
+_NS = {
+    "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+    "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
+    "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    "rel": "http://schemas.openxmlformats.org/package/2006/relationships",
+}
+_NOTES_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide"
+
+
+def _rels(zf: zipfile.ZipFile, part: str) -> Dict[str, Tuple[str, str]]:
+    """Relationship id -> (type, absolute target) for an OOXML part."""
+    rels_path = posixpath.join(posixpath.dirname(part), "_rels", posixpath.basename(part) + ".rels")
+    if rels_path not in zf.namelist():
+        return {}
+    root = ElementTree.fromstring(zf.read(rels_path))
+    out = {}
+    for rel in root.findall("rel:Relationship", _NS):
+        target = posixpath.normpath(posixpath.join(posixpath.dirname(part), rel.get("Target", "")))
+        out[rel.get("Id")] = (rel.get("Type", ""), target)
+    return out
+
+
+def _paragraph_text(xml_bytes: bytes) -> str:
+    """All text in a slide/notes part, one line per paragraph."""
+    root = ElementTree.fromstring(xml_bytes)
+    lines = []
+    for para in root.iter(f"{{{_NS['a']}}}p"):
+        text = "".join(t.text or "" for t in para.iter(f"{{{_NS['a']}}}t")).strip()
+        if text:
+            lines.append(text)
+    return "\n".join(lines)
+
+
+def _slide_number(name: str) -> int:
+    m = re.search(r"(\d+)\.xml$", name)
+    return int(m.group(1)) if m else 0
+
+
+def extract_pptx_sections(data: bytes) -> Sections:
+    """One section per slide ("slide N", in presentation order) incl. speaker notes."""
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        names = set(zf.namelist())
+        xml_size = sum(i.file_size for i in zf.infolist() if i.filename.endswith(".xml"))
+        if xml_size > MAX_PPTX_XML_BYTES:
+            raise ValueError("presentation is too large to read")
+
+        slides: List[str] = []
+        if "ppt/presentation.xml" in names:
+            rels = _rels(zf, "ppt/presentation.xml")
+            pres = ElementTree.fromstring(zf.read("ppt/presentation.xml"))
+            for sld in pres.iterfind("p:sldIdLst/p:sldId", _NS):
+                rel = rels.get(sld.get(f"{{{_NS['r']}}}id"))
+                if rel and rel[1] in names:
+                    slides.append(rel[1])
+        if not slides:   # fall back to file-name order
+            slides = sorted((n for n in names if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)),
+                            key=_slide_number)
+
+        sections: Sections = []
+        for number, slide in enumerate(slides[:MAX_SLIDES], start=1):
+            parts = [_paragraph_text(zf.read(slide))]
+            for rel_type, target in _rels(zf, slide).values():
+                if rel_type == _NOTES_REL and target in names:
+                    notes = _paragraph_text(zf.read(target))
+                    # notes slides repeat the slide number placeholder; drop bare digits
+                    notes = "\n".join(l for l in notes.split("\n") if not l.isdigit())
+                    if notes:
+                        parts.append("Speaker notes:\n" + notes)
+            sections.append({"locator": f"slide {number}", "text": "\n\n".join(p for p in parts if p)})
+        return sections
+
+
+async def extract_file_sections(env, bucket, key: str) -> Tuple[Sections, Optional[str]]:
+    """Read an R2 object and return ``(sections, skip_reason)``.
+
+    On success *skip_reason* is None. Otherwise *sections* is empty and
+    *skip_reason* says why, so the teacher can see which files the tutor
+    cannot read.
     """
     key = (key or "").lstrip("/")
     ext = _extension(key)
-    if ext not in PLAIN_TEXT_TYPES and ext not in CONVERTIBLE_TYPES:
-        return "", f"unsupported file type '{ext or 'none'}'"
+    if ext in SAVE_AS_HINTS:
+        return [], SAVE_AS_HINTS[ext]
+    known = (PLAIN_TEXT_TYPES, MARKDOWN_TYPES, CONVERTIBLE_TYPES)
+    if ext != PPTX_TYPE and not any(ext in t for t in known):
+        return [], f"unsupported file type '{ext or 'none'}'"
     if bucket is None:
-        return "", "file storage is not configured"
+        return [], "file storage is not configured"
 
     obj = await bucket.get(key)
     if not obj:
-        return "", "file not found in storage"
+        return [], "file not found in storage"
     size = int(getattr(obj, "size", 0) or 0)
     if size > MAX_FILE_BYTES:
-        return "", f"file is larger than {MAX_FILE_BYTES // (1024 * 1024)} MB"
+        return [], f"file is larger than {MAX_FILE_BYTES // (1024 * 1024)} MB"
     buf = await obj.arrayBuffer()
 
     if ext in PLAIN_TEXT_TYPES:
-        text = bytes(js.Uint8Array.new(buf)).decode("utf-8", "replace")
+        sections = [{"locator": "", "text": bytes(js.Uint8Array.new(buf)).decode("utf-8", "replace")}]
+    elif ext in MARKDOWN_TYPES:
+        sections = split_markdown_sections(bytes(js.Uint8Array.new(buf)).decode("utf-8", "replace"))
+    elif ext == PPTX_TYPE:
+        try:
+            sections = extract_pptx_sections(bytes(js.Uint8Array.new(buf)))
+        except (zipfile.BadZipFile, ElementTree.ParseError, KeyError):
+            return [], "could not read presentation (is it a valid .pptx?)"
+        except ValueError as exc:
+            return [], str(exc)
     else:
         ai, _ = _bindings(env)
         blob = js.Blob.new(to_js([buf]), _js({"type": CONVERTIBLE_TYPES[ext]}))
         result = _py(await ai.toMarkdown(_js([{"name": key.rsplit("/", 1)[-1], "blob": blob}])))
         doc = (result[0] if isinstance(result, list) and result else result) or {}
         if doc.get("format") == "error":
-            return "", f"could not convert file: {str(doc.get('data') or '')[:200]}"
-        text = str(doc.get("data") or "")
+            detail = str(doc.get("error") or doc.get("data") or "unknown error")[:200]
+            return [], f"could not convert file: {detail}"
+        sections = split_markdown_sections(str(doc.get("data") or ""))
 
-    text = text.strip()
-    if not text:
-        return "", "file contains no extractable text"
-    return text[:MAX_EXTRACTED_CHARS], None
+    sections = _cap_sections(sections)
+    if not sections:
+        return [], "file contains no extractable text"
+    return sections, None
 
 
 async def embed_texts(env, texts: List[str]) -> List[List[float]]:
@@ -293,7 +444,7 @@ async def index_activity(env, activity_id: str, sources: List[Dict[str, Any]],
 
     if changed:
         vectors = await embed_texts(
-            env, [embedding_input(c["source_title"], c["text"]) for c in changed]
+            env, [embedding_input(c["source_title"], c["locator"], c["text"]) for c in changed]
         )
         records = [
             {
@@ -310,17 +461,18 @@ async def index_activity(env, activity_id: str, sources: List[Dict[str, Any]],
         for c in changed:
             await env.DB.prepare(
                 "INSERT INTO tutor_chunks"
-                " (id, activity_id, source_type, source_id, source_title, chunk_index,"
+                " (id, activity_id, source_type, source_id, source_title, locator, chunk_index,"
                 "  text_encrypted, content_hash, updated_at)"
-                " VALUES (?,?,?,?,?,?,?,?,datetime('now'))"
+                " VALUES (?,?,?,?,?,?,?,?,?,datetime('now'))"
                 " ON CONFLICT(id) DO UPDATE SET"
                 "  source_title=excluded.source_title,"
+                "  locator=excluded.locator,"
                 "  text_encrypted=excluded.text_encrypted,"
                 "  content_hash=excluded.content_hash,"
                 "  updated_at=excluded.updated_at"
             ).bind(
                 c["id"], activity_id, c["source_type"], c["source_id"],
-                c["source_title"], c["chunk_index"],
+                c["source_title"], c["locator"], c["chunk_index"],
                 await encrypt(c["text"]), c["content_hash"],
             ).run()
 
@@ -348,7 +500,7 @@ async def retrieve(env, activity_id: str, query: str, decrypt: Crypt,
     """Return the activity's chunks most relevant to *query*, best first.
 
     Each hit carries what a caller needs to cite it: source type/id/title,
-    chunk index, text, and similarity score.
+    locator (e.g. "slide 7"), chunk index, text, and similarity score.
     """
     _, index = _bindings(env)
     query = (query or "").strip()[:MAX_QUERY_CHARS]
@@ -370,7 +522,7 @@ async def retrieve(env, activity_id: str, query: str, decrypt: Crypt,
     ids = list(scores)
     placeholders = ",".join("?" for _ in ids)
     rows_res = await env.DB.prepare(
-        "SELECT id, source_type, source_id, source_title, chunk_index, text_encrypted"
+        "SELECT id, source_type, source_id, source_title, locator, chunk_index, text_encrypted"
         f" FROM tutor_chunks WHERE activity_id=? AND id IN ({placeholders})"
     ).bind(activity_id, *ids).all()
 
@@ -381,6 +533,7 @@ async def retrieve(env, activity_id: str, query: str, decrypt: Crypt,
             "source_type": row.source_type,
             "source_id": row.source_id,
             "source_title": row.source_title,
+            "locator": row.locator or "",
             "chunk_index": row.chunk_index,
             "text": await decrypt(row.text_encrypted or ""),
             "score": round(scores.get(row.id, 0.0), 4),

@@ -8,10 +8,12 @@ real SQL and real ranking behaviour rather than scripted mock call sequences.
 """
 
 import hashlib
+import io
 import json
 import math
 import re
 import sqlite3
+import zipfile
 from types import SimpleNamespace
 
 import pytest
@@ -86,9 +88,9 @@ class FakeAI:
         for d in docs:
             raw = b"".join(d["blob"].parts).decode()
             if raw.startswith("BROKEN"):
-                out.append({"name": d["name"], "format": "error", "data": "corrupt file"})
+                out.append({"name": d["name"], "format": "error", "error": "corrupt file"})
             else:
-                out.append({"name": d["name"], "mimeType": d["blob"].type,
+                out.append({"name": d["name"], "mimetype": d["blob"].type,
                             "format": "markdown", "tokens": 1, "data": "# Converted\n" + raw})
         self.calls.append(("toMarkdown", [d["name"] for d in docs]))
         return out
@@ -195,58 +197,178 @@ class TestBuildChunks:
         with pytest.raises(ValueError):
             tutor_rag.build_chunks("a", [{"source_type": "web", "source_id": "1", "text": "x"}])
 
+    def test_chunks_never_span_sections_and_carry_locator(self):
+        src = [{"source_type": "material", "source_id": "m", "title": "Deck", "sections": [
+            {"locator": "slide 1", "text": "Alpha."},
+            {"locator": "slide 2", "text": "Beta."},
+        ]}]
+        chunks = tutor_rag.build_chunks("a", src)
+        assert [(c["locator"], c["text"], c["chunk_index"]) for c in chunks] == \
+            [("slide 1", "Alpha.", 0), ("slide 2", "Beta.", 1)]
+
+    def test_moving_text_to_another_slide_changes_hash(self):
+        def chunk(locator):
+            return tutor_rag.build_chunks("a", [{"source_type": "material", "source_id": "m", "title": "D",
+                                                 "sections": [{"locator": locator, "text": "Same."}]}])[0]
+        assert chunk("slide 1")["content_hash"] != chunk("slide 2")["content_hash"]
+
     def test_empty_sources_produce_no_chunks(self):
         assert tutor_rag.build_chunks("a", [{"source_type": "session", "source_id": "1", "text": ""}]) == []
 
 
 # ---------------------------------------------------------------------------
-# File text extraction
+# File extraction
 # ---------------------------------------------------------------------------
 
-class TestExtractFileText:
+_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_P = "http://schemas.openxmlformats.org/presentationml/2006/main"
+_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+
+def _text_part(root_tag, paragraphs):
+    paras = "".join(f"<a:p><a:r><a:t>{t}</a:t></a:r></a:p>" for t in paragraphs)
+    return (f'<{root_tag} xmlns:a="{_A}" xmlns:p="{_P}"><p:cSld><p:spTree><p:sp><p:txBody>'
+            f"{paras}</p:txBody></p:sp></p:spTree></p:cSld></{root_tag}>")
+
+
+def make_pptx(slides, order=None, with_presentation=True):
+    """Build a minimal .pptx. *slides* is a list of (paragraphs, notes or None),
+    stored as slide1.xml, slide2.xml, ...; *order* lists file numbers in
+    presentation order (defaults to file order)."""
+    buf = io.BytesIO()
+    order = order or list(range(1, len(slides) + 1))
+    with zipfile.ZipFile(buf, "w") as zf:
+        if with_presentation:
+            ids = "".join(f'<p:sldId id="{255 + n}" r:id="rId{n}"/>' for n in order)
+            zf.writestr("ppt/presentation.xml",
+                        f'<p:presentation xmlns:p="{_P}" xmlns:r="{_R}"><p:sldIdLst>{ids}</p:sldIdLst></p:presentation>')
+            rels = "".join(f'<Relationship Id="rId{n}" Type="{_R}/slide" Target="slides/slide{n}.xml"/>'
+                           for n in range(1, len(slides) + 1))
+            zf.writestr("ppt/_rels/presentation.xml.rels", f'<Relationships xmlns="{_REL}">{rels}</Relationships>')
+        for n, (paragraphs, notes) in enumerate(slides, start=1):
+            zf.writestr(f"ppt/slides/slide{n}.xml", _text_part("p:sld", paragraphs))
+            if notes is not None:
+                zf.writestr(f"ppt/slides/_rels/slide{n}.xml.rels",
+                            f'<Relationships xmlns="{_REL}"><Relationship Id="rId9" '
+                            f'Type="{_R}/notesSlide" Target="../notesSlides/notesSlide{n}.xml"/></Relationships>')
+                zf.writestr(f"ppt/notesSlides/notesSlide{n}.xml", _text_part("p:notes", notes + [str(n)]))
+    return buf.getvalue()
+
+
+class TestMarkdownSections:
+    def test_split_at_headings(self):
+        md = "Intro line.\n\n# Cells\nCells are small.\n\n## Mitosis ##\nCells divide."
+        assert tutor_rag.split_markdown_sections(md) == [
+            {"locator": "", "text": "Intro line.\n"},
+            {"locator": "section: Cells", "text": "# Cells\nCells are small.\n"},
+            {"locator": "section: Mitosis", "text": "## Mitosis ##\nCells divide."},
+        ]
+
+    def test_no_headings_is_one_section(self):
+        assert tutor_rag.split_markdown_sections("just text") == [{"locator": "", "text": "just text"}]
+
+
+class TestPptx:
+    def test_one_section_per_slide_with_notes(self):
+        data = make_pptx([(["Cell biology", "Week 1"], ["Remind students about the lab."]),
+                          (["Mitochondria", "Produce ATP"], None)])
+        assert tutor_rag.extract_pptx_sections(data) == [
+            {"locator": "slide 1",
+             "text": "Cell biology\nWeek 1\n\nSpeaker notes:\nRemind students about the lab."},
+            {"locator": "slide 2", "text": "Mitochondria\nProduce ATP"},
+        ]
+
+    def test_follows_presentation_order_not_file_names(self):
+        data = make_pptx([(["File one"], None), (["File two"], None)], order=[2, 1])
+        sections = tutor_rag.extract_pptx_sections(data)
+        assert [(s["locator"], s["text"]) for s in sections] == [("slide 1", "File two"), ("slide 2", "File one")]
+
+    def test_falls_back_to_file_order(self):
+        data = make_pptx([(["A"], None), (["B"], None)], with_presentation=False)
+        assert [s["text"] for s in tutor_rag.extract_pptx_sections(data)] == ["A", "B"]
+
+    def test_zip_bomb_guard(self, monkeypatch):
+        monkeypatch.setattr(tutor_rag, "MAX_PPTX_XML_BYTES", 100)
+        with pytest.raises(ValueError):
+            tutor_rag.extract_pptx_sections(make_pptx([(["x" * 200], None)]))
+
+
+class TestExtractFileSections:
     def _env(self):
         return SimpleNamespace(AI=FakeAI(), VECTORIZE=FakeVectorize())
 
     async def test_plain_text_read_directly(self):
         env = self._env()
-        bucket = FakeR2({"notes/week1.md": b"Osmosis moves water across membranes."})
-        text, reason = await tutor_rag.extract_file_text(env, bucket, "/notes/week1.md")
-        assert (text, reason) == ("Osmosis moves water across membranes.", None)
+        bucket = FakeR2({"notes/week1.txt": b"Osmosis moves water across membranes."})
+        sections, reason = await tutor_rag.extract_file_sections(env, bucket, "/notes/week1.txt")
+        assert reason is None
+        assert sections == [{"locator": "", "text": "Osmosis moves water across membranes."}]
         assert env.AI.calls == []   # no AI call for plain text
+
+    async def test_markdown_located_by_heading(self):
+        bucket = FakeR2({"n.md": b"# Osmosis\nWater moves."})
+        sections, _ = await tutor_rag.extract_file_sections(self._env(), bucket, "n.md")
+        assert sections == [{"locator": "section: Osmosis", "text": "# Osmosis\nWater moves."}]
+
+    async def test_pptx_parsed_locally(self):
+        env = self._env()
+        bucket = FakeR2({"deck.pptx": make_pptx([(["Krebs cycle"], None)])})
+        sections, reason = await tutor_rag.extract_file_sections(env, bucket, "deck.pptx")
+        assert reason is None
+        assert sections == [{"locator": "slide 1", "text": "Krebs cycle"}]
+        assert env.AI.calls == []
+
+    async def test_corrupt_pptx(self):
+        bucket = FakeR2({"deck.pptx": b"not a zip"})
+        sections, reason = await tutor_rag.extract_file_sections(self._env(), bucket, "deck.pptx")
+        assert sections == [] and "valid .pptx" in reason
+
+    async def test_old_formats_get_save_as_hint(self):
+        for name, hint in (("old.ppt", ".pptx or PDF"), ("old.doc", ".docx or PDF")):
+            sections, reason = await tutor_rag.extract_file_sections(self._env(), FakeR2(), name)
+            assert sections == [] and hint in reason
 
     async def test_pdf_converted_with_to_markdown(self):
         env = self._env()
         bucket = FakeR2({"slides.pdf": b"Krebs cycle overview"})
-        text, reason = await tutor_rag.extract_file_text(env, bucket, "slides.pdf")
+        sections, reason = await tutor_rag.extract_file_sections(env, bucket, "slides.pdf")
         assert reason is None
-        assert "Krebs cycle overview" in text
+        assert sections[0]["locator"] == "section: Converted"
+        assert "Krebs cycle overview" in sections[0]["text"]
         assert env.AI.calls == [("toMarkdown", ["slides.pdf"])]
 
     async def test_conversion_error_is_reported(self):
         bucket = FakeR2({"bad.pdf": b"BROKEN"})
-        text, reason = await tutor_rag.extract_file_text(self._env(), bucket, "bad.pdf")
-        assert text == "" and "corrupt file" in reason
+        sections, reason = await tutor_rag.extract_file_sections(self._env(), bucket, "bad.pdf")
+        assert sections == [] and reason == "could not convert file: corrupt file"
 
     async def test_images_are_skipped_without_reading(self):
         env = self._env()
         bucket = FakeR2({"diagram.png": b"\x89PNG"})
-        text, reason = await tutor_rag.extract_file_text(env, bucket, "diagram.png")
-        assert text == "" and "unsupported" in reason
+        sections, reason = await tutor_rag.extract_file_sections(env, bucket, "diagram.png")
+        assert sections == [] and "unsupported" in reason
         assert env.AI.calls == []
 
     async def test_missing_file(self):
-        text, reason = await tutor_rag.extract_file_text(self._env(), FakeR2(), "gone.txt")
-        assert text == "" and "not found" in reason
+        sections, reason = await tutor_rag.extract_file_sections(self._env(), FakeR2(), "gone.txt")
+        assert sections == [] and "not found" in reason
 
     async def test_oversized_file(self, monkeypatch):
         monkeypatch.setattr(tutor_rag, "MAX_FILE_BYTES", 10)
         bucket = FakeR2({"big.txt": b"x" * 11})
-        text, reason = await tutor_rag.extract_file_text(self._env(), bucket, "big.txt")
-        assert text == "" and "larger than" in reason
+        sections, reason = await tutor_rag.extract_file_sections(self._env(), bucket, "big.txt")
+        assert sections == [] and "larger than" in reason
 
     async def test_no_bucket(self):
-        text, reason = await tutor_rag.extract_file_text(self._env(), None, "a.txt")
-        assert text == "" and "not configured" in reason
+        sections, reason = await tutor_rag.extract_file_sections(self._env(), None, "a.txt")
+        assert sections == [] and "not configured" in reason
+
+    async def test_total_text_is_capped(self, monkeypatch):
+        monkeypatch.setattr(tutor_rag, "MAX_EXTRACTED_CHARS", 25)
+        data = make_pptx([(["a" * 20], None), (["b" * 20], None), (["c" * 20], None)])
+        sections, _ = await tutor_rag.extract_file_sections(self._env(), FakeR2({"d.pptx": data}), "d.pptx")
+        assert [len(s["text"]) for s in sections] == [20, 5]
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +520,15 @@ async def _seed(worker, env):
     )
     env.MY_BUCKET.files["materials/cell.png"] = b"\x89PNG"
     await env.DB.prepare(
+        "INSERT INTO activity_materials (id, activity_id, title, file_r2_key, display_order)"
+        " VALUES (?,?,?,?,?)"
+    ).bind("m5", "act1", "Genetics deck", "materials/genetics.pptx", 4).run()
+    env.MY_BUCKET.files["materials/genetics.pptx"] = make_pptx([
+        (["Genetics", "Course overview"], None),
+        (["Alleles", "Dominant alleles mask recessive alleles in heterozygotes."],
+         ["Draw a Punnett square on the board."]),
+    ])
+    await env.DB.prepare(
         "INSERT INTO enrollments (id, activity_id, user_id, status) VALUES (?,?,?,?)"
     ).bind("e1", "act1", "student1", "active").run()
 
@@ -423,9 +554,10 @@ class TestTutorEndpoints:
         resp = await worker._dispatch(_req(worker, env, "POST", "/api/activities/act1/tutor/reindex", HOST), env)
         assert resp.status == 200, resp.body
         data = json.loads(resp.body)["data"]
-        # activity + session + handout + slides (the image and link have no text)
+        # activity description + objectives, session, handout, pdf, 2 slides
+        # (the image and the link contribute no text)
         assert {k: data[k] for k in ("chunks", "embedded", "unchanged", "removed")} == \
-            {"chunks": 4, "embedded": 4, "unchanged": 0, "removed": 0}
+            {"chunks": 7, "embedded": 7, "unchanged": 0, "removed": 0}
         assert sorted((f["material_id"], f["reason"]) for f in data["skipped_files"]) == [
             ("m3", "unsupported file type '.png'"),
             ("m4", "external links are not fetched"),
@@ -445,11 +577,17 @@ class TestTutorEndpoints:
             ("material", "m2", "Week 3 slides")
         assert "cellular respiration" in hit["text"]
 
+    async def test_search_cites_the_slide(self, worker, env):
+        await _seed(worker, env)
+        [hit] = await self._search(worker, env, "dominant+recessive+alleles+heterozygotes")
+        assert (hit["source_id"], hit["source_title"], hit["locator"]) == ("m5", "Genetics deck", "slide 2")
+        assert "Punnett square" in hit["text"]   # speaker notes come along
+
     async def test_learning_objectives_are_searchable(self, worker, env):
         await _seed(worker, env)
         [hit] = await self._search(worker, env, "ribosomes+protein+synthesis")
-        assert hit["source_type"] == "activity"
-        assert "Learning objectives" in hit["text"]
+        assert (hit["source_type"], hit["locator"]) == ("activity", "learning objectives")
+        assert "ribosomes" in hit["text"]
 
     async def test_student_cannot_reindex(self, worker, env):
         await _seed(worker, env)
