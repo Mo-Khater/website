@@ -147,6 +147,10 @@ Frontend Server will start at:
 ```bash
 http://localhost:3000
 ```
+## AI tutor
+
+Each course can have an AI tutor that answers only from the course's own materials, with citations, under teacher controls. See [TUTOR.md](TUTOR.md) for how it works and how to enable it.
+
 ## API Endpoints
 
 ### Authentication
