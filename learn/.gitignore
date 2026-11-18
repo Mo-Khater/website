@@ -43,3 +43,6 @@ legacy-site-source/
 # AI tutor eval (tutor_eval/run_eval.py)
 .tutor-eval-state.json
 tutor-eval-report.json
+
+# CRAG benchmark data and results (CC BY-NC data; not ours to commit)
+crag/
