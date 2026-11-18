@@ -365,6 +365,21 @@ class TestIndexAndRetrieve:
         hits = await tutor_rag.retrieve(env, "bio", "chlorophyll sunlight magnesium", _identity, top_k=10)
         assert hits and all(h["source_id"] in {"bio", "s1", "s2"} for h in hits)
 
+    async def test_retrieve_several_queries_keeps_each_chunks_best_score(self, env):
+        await tutor_rag.index_activity(env, "bio", BIO, _identity)
+        env.AI.calls.clear()
+        [plants] = await tutor_rag.retrieve(env, "bio", "chlorophyll sunlight", _identity, top_k=1)
+        [cells] = await tutor_rag.retrieve(env, "bio", "mitosis daughter cells", _identity, top_k=1)
+        env.AI.calls.clear()
+        both = await tutor_rag.retrieve(env, "bio", ["chlorophyll sunlight", "mitosis daughter cells"],
+                                        _identity, top_k=3)
+        assert env.AI.calls == [(tutor_rag.EMBED_MODEL, ["chlorophyll sunlight", "mitosis daughter cells"])]
+        by_id = {h["chunk_id"]: h["score"] for h in both}
+        assert by_id[plants["chunk_id"]] == plants["score"]
+        assert by_id[cells["chunk_id"]] == cells["score"]
+        assert len(by_id) == len(both) <= 3
+        assert both == sorted(both, key=lambda h: h["score"], reverse=True)
+
     async def test_retrieve_empty_query(self, env):
         assert await tutor_rag.retrieve(env, "bio", "   ", _identity) == []
 

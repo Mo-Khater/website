@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 import tutor_chat
+import tutor_policy
 from tests.helpers import MockRequest, load_worker
 from tests.tutor_fakes import FakeAI, FakeR2, FakeVectorize, SqliteD1
 
@@ -62,15 +63,29 @@ class TestBuildMessages:
         assert all(m["role"] in ("user", "assistant") for m in middle)
         assert middle[-1]["content"] == "m9"
 
+    def test_history_rule_only_when_there_are_earlier_replies(self):
+        first = tutor_chat.build_messages("C", [_hit(1)], [], "Q?", {"mode": "answer"})
+        assert tutor_chat.HISTORY_RULE not in first[0]["content"]
+        history = [{"role": "user", "content": "Where?"},
+                   {"role": "assistant", "content": "Look at source [1]. Where could it be?"}]
+        later = tutor_chat.build_messages("C", [_hit(1)], history, "Q?", {"mode": "answer"})
+        assert tutor_chat.HISTORY_RULE in later[0]["content"]
+
+    def test_history_rule_comes_after_the_policy_rules(self):
+        history = [{"role": "user", "content": "Q"}, {"role": "assistant", "content": "A [1]."}]
+        system = tutor_chat.build_messages("C", [_hit(1)], history, "Q?", {"mode": "hint_only"})[0]["content"]
+        assert system.index(tutor_policy.HINT_ONLY_RULE.strip()[:40]) < system.index(tutor_chat.HISTORY_RULE)
+
 
 class TestRetrievalQuery:
     def test_follow_up_includes_previous_question(self):
         history = [{"role": "user", "content": "What are alleles?"},
                    {"role": "assistant", "content": "Variants of a gene [1]."}]
-        assert tutor_chat.retrieval_query("And dominant ones?", history) == "What are alleles?\nAnd dominant ones?"
+        assert tutor_chat.retrieval_queries("And dominant ones?", history) == [
+            "And dominant ones?", "What are alleles?\nAnd dominant ones?"]
 
     def test_first_question(self):
-        assert tutor_chat.retrieval_query("Q", []) == "Q"
+        assert tutor_chat.retrieval_queries("Q", []) == ["Q"]
 
 
 class TestCitedFraction:
@@ -194,6 +209,9 @@ class TestChatEndpoint:
         assert [m["role"] for m in msgs] == ["system", "user", "assistant", "user"]
         assert msgs[1]["content"] == "How do plants capture sunlight?"
         assert msgs[2]["content"] == "Chlorophyll [1]."
+        # searched with the question alone (a new topic) and with the previous one (a follow-up)
+        assert env.AI.calls[-1][1] == ["And what do they make?",
+                                       "How do plants capture sunlight?\nAnd what do they make?"]
 
     async def test_cannot_continue_someone_elses_conversation(self, worker, env):
         _, first = await _chat(worker, env, "student1", "How do plants capture sunlight?")

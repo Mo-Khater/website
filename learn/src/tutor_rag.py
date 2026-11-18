@@ -29,7 +29,7 @@ import io
 import posixpath
 import re
 import zipfile
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, Union
 from xml.etree import ElementTree
 
 import js
@@ -548,31 +548,38 @@ async def index_activity(env, activity_id: str, sources: List[Dict[str, Any]],
 # Retrieval
 # ---------------------------------------------------------------------------
 
-async def retrieve(env, activity_id: str, query: str, decrypt: Crypt,
+async def retrieve(env, activity_id: str, query: Union[str, List[str]], decrypt: Crypt,
                    top_k: int = 5, min_score: float = 0.0) -> List[Dict[str, Any]]:
     """Return the activity's chunks most relevant to *query*, best first.
+
+    *query* may be a list of alternative queries (e.g. a question alone and
+    the question with the previous one for context). They are embedded in one
+    call, and each chunk keeps its best score across them.
 
     Each hit carries what a caller needs to cite it: source type/id/title,
     locator (e.g. "slide 7"), chunk index, text, and similarity score.
     """
     _, index = _bindings(env)
-    query = (query or "").strip()[:MAX_QUERY_CHARS]
-    if not query:
+    queries = [query] if isinstance(query, str) else list(query or [])
+    queries = list(dict.fromkeys(q for q in ((q or "").strip()[:MAX_QUERY_CHARS] for q in queries) if q))
+    if not queries:
         return []
     top_k = max(1, min(int(top_k), MAX_TOP_K))
 
-    [vector] = await embed_texts(env, [query])
-    result = _py(await index.query(
-        _js(vector),
-        _js({"topK": top_k, "namespace": activity_id, "returnMetadata": "none"}),
-    ))
-    matches = [m for m in ((result or {}).get("matches") or [])
-               if float(m.get("score") or 0.0) >= min_score]
-    if not matches:
+    scores: Dict[str, float] = {}
+    for vector in await embed_texts(env, queries):
+        result = _py(await index.query(
+            _js(vector),
+            _js({"topK": top_k, "namespace": activity_id, "returnMetadata": "none"}),
+        ))
+        for m in (result or {}).get("matches") or []:
+            score = float(m.get("score") or 0.0)
+            if score >= min_score and score > scores.get(m["id"], -1.0):
+                scores[m["id"]] = score
+    if not scores:
         return []
 
-    scores = {m["id"]: float(m.get("score") or 0.0) for m in matches}
-    ids = list(scores)
+    ids = sorted(scores, key=scores.get, reverse=True)[:top_k]
     placeholders = ",".join("?" for _ in ids)
     rows_res = await env.DB.prepare(
         "SELECT id, source_type, source_id, source_title, locator, chunk_index, text_encrypted"

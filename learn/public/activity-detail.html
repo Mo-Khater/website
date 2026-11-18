@@ -449,11 +449,50 @@
     document.getElementById('tutor-new').classList.toggle('hidden', !tutorState.items.length);
   }
 
+  const TUTOR_INTRO = document.getElementById('tutor-intro').textContent;
+  const TUTOR_HINT_INTRO = "Your teacher set the tutor to give hints: it points you to the right part of the course and asks questions to help you work it out.";
+
+  const TUTOR_OFF = 'Your teacher has turned the tutor off for this course.';
+  let tutorBusy = false;      // a question is waiting for its answer
+  let tutorLastCheck = 0;
+
+  // Applied on page load and again whenever the student comes back to the
+  // page, so the teacher's changes (on/off, hints only <-> full answers,
+  // daily limit) show up without a reload.
   function tutorSetStatus(status) {
+    const card = document.getElementById('tutor-card');
+    if (!status.available) {
+      // Off (or not set up): don't show the card; if it's already open, keep
+      // the conversation readable but stop new questions.
+      if (!card.classList.contains('hidden')) {
+        document.getElementById('tutor-mode-tag').classList.add('hidden');
+        tutorDisable(TUTOR_OFF);
+      }
+      return;
+    }
+    if (card.classList.contains('hidden')) {
+      tutorRestore();
+      tutorRender();
+      card.classList.remove('hidden');
+    }
+    document.querySelector('#tutor-notice span').textContent = status.notice;
+    if (status.is_host) {
+      const note = document.getElementById('tutor-host-note');
+      note.innerHTML = (status.enabled
+        ? 'Students in this activity can use the tutor. '
+        : '<strong>Students can\'t see the tutor yet</strong> &mdash; only you can, as a preview. ') +
+        '<a class="underline font-bold" href="/tutor-settings?id=' + encodeURIComponent(tutorActivityId) + '">Tutor settings</a>';
+      note.classList.remove('hidden');
+    }
+    const hints = status.mode === 'hint_only';
+    document.getElementById('tutor-mode-tag').classList.toggle('hidden', !hints);
+    document.getElementById('tutor-intro').textContent = hints ? TUTOR_HINT_INTRO : TUTOR_INTRO;
     if (status.remaining_today === 0) {
       tutorDisable("You've used all of today's tutor questions. They reset at midnight UTC.");
       return;
     }
+    document.getElementById('tutor-input').disabled = false;
+    document.getElementById('tutor-send').disabled = tutorBusy;
     document.getElementById('tutor-status').textContent = status.remaining_today == null ? ''
       : status.remaining_today + ' of ' + status.daily_limit + ' questions left today.';
   }
@@ -472,32 +511,22 @@
     return body.data;
   }
 
+  async function tutorRefresh() {
+    if (Date.now() - tutorLastCheck < 3000) return;   // focus + visibility often fire together
+    tutorLastCheck = Date.now();
+    try { tutorSetStatus(await tutorFetchStatus()); } catch (e) { /* keep what's shown */ }
+  }
+
   async function loadTutor(data) {
     if (!token || !(data.is_enrolled || data.is_host) || typeof A1Tutor === 'undefined') return;
     tutorActivityId = data.activity.id;
-    let status;
-    try { status = await tutorFetchStatus(); } catch (e) { return; }
-    if (!status.available) return;   // off for students, or not set up on this site
-
-    const card = document.getElementById('tutor-card');
-    document.querySelector('#tutor-notice span').textContent = status.notice;
-    document.getElementById('tutor-mode-tag').classList.toggle('hidden', status.mode !== 'hint_only');
-    if (status.mode === 'hint_only') {
-      document.getElementById('tutor-intro').textContent =
-        "Your teacher set the tutor to give hints: it points you to the right part of the course and asks questions to help you work it out.";
-    }
-    if (status.is_host) {
-      const note = document.getElementById('tutor-host-note');
-      note.innerHTML = (status.enabled
-        ? 'Students in this activity can use the tutor. '
-        : '<strong>Students can\'t see the tutor yet</strong> &mdash; only you can, as a preview. ') +
-        '<a class="underline font-bold" href="/tutor-settings?id=' + encodeURIComponent(tutorActivityId) + '">Tutor settings</a>';
-      note.classList.remove('hidden');
-    }
-    tutorSetStatus(status);
-    tutorRestore();
-    tutorRender();
-    card.classList.remove('hidden');
+    // Window focus covers a teacher window side by side; visibility covers tabs.
+    window.addEventListener('focus', tutorRefresh);
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') tutorRefresh();
+    });
+    tutorLastCheck = Date.now();
+    try { tutorSetStatus(await tutorFetchStatus()); } catch (e) { /* tutor unavailable */ }
   }
 
   async function tutorAsk(message) {
@@ -505,6 +534,7 @@
     tutorState.items.push(item);
     tutorRender();
     const send = document.getElementById('tutor-send');
+    tutorBusy = true;
     send.disabled = true;
     try {
       const res = await fetch('/api/activities/' + encodeURIComponent(tutorActivityId) + '/tutor/chat', {
@@ -538,7 +568,9 @@
       document.getElementById('tutor-thread').insertAdjacentHTML('beforeend', tutorItemHtml(item));
     }
     tutorSave();
+    tutorBusy = false;
     if (!document.getElementById('tutor-input').disabled) send.disabled = false;
+    tutorLastCheck = Date.now();
     try { tutorSetStatus(await tutorFetchStatus()); } catch (e) { /* keep the old count */ }
   }
 

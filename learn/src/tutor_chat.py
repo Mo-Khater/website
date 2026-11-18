@@ -75,22 +75,41 @@ def format_sources(hits: List[Dict[str, Any]]) -> str:
     return "\n\n".join(blocks)
 
 
+# The teacher can change the mode mid-conversation. Without this note the
+# model copies the style of its earlier replies (e.g. keeps giving hints after
+# the teacher switched to full answers), because history outweighs the rules.
+HISTORY_RULE = ("- Earlier replies in this conversation may have followed different settings. "
+                "Follow the rules above now, not the style of earlier replies.")
+
+
 def build_messages(course_title: str, hits: List[Dict[str, Any]],
                    history: List[Dict[str, str]], question: str,
                    policy: Optional[Dict[str, Any]] = None) -> List[Dict[str, str]]:
+    turns = [{"role": m["role"], "content": m["content"]}
+             for m in history[-HISTORY_MESSAGES:] if m.get("role") in ("user", "assistant")]
     rules = tutor_policy.prompt_rules(tutor_policy.normalize(policy))
+    if any(t["role"] == "assistant" for t in turns):
+        rules = f"{rules}\n{HISTORY_RULE}" if rules else HISTORY_RULE
     system = SYSTEM_PROMPT.format(course=course_title or "this course",
                                   policy_rules=f"{rules}\n" if rules else "",
                                   sources=format_sources(hits))
-    turns = [{"role": m["role"], "content": m["content"]}
-             for m in history[-HISTORY_MESSAGES:] if m.get("role") in ("user", "assistant")]
     return [{"role": "system", "content": system}, *turns, {"role": "user", "content": question}]
 
 
-def retrieval_query(question: str, history: List[Dict[str, str]]) -> str:
-    """Follow-ups like "what about the second one?" need the previous question."""
+def retrieval_queries(question: str, history: List[Dict[str, str]]) -> List[str]:
+    """What to search for: the question alone, plus the question with the
+    previous one when there is a previous one.
+
+    A follow-up like "when was that?" only finds anything with the previous
+    question for context, but a new topic ("and Mercury's year?") after
+    "what makes Mars red?" gets drowned out by it. Searching both and keeping
+    each passage's best score handles both cases.
+    """
     previous = [m["content"] for m in history if m.get("role") == "user"][-1:]
-    return "\n".join(previous + [question])[:tutor_rag.MAX_QUERY_CHARS]
+    queries = [question[:tutor_rag.MAX_QUERY_CHARS]]
+    if previous:
+        queries.append("\n".join(previous + [question])[:tutor_rag.MAX_QUERY_CHARS])
+    return queries
 
 
 def extract_reply(result: Any) -> str:
@@ -180,7 +199,7 @@ async def answer(env, activity_id: str, course_title: str, question: str,
     if topic:
         return result(tutor_policy.refusal_message(topic), "refused_topic", refused_topic=topic)
 
-    hits = await tutor_rag.retrieve(env, activity_id, retrieval_query(question, history), decrypt,
+    hits = await tutor_rag.retrieve(env, activity_id, retrieval_queries(question, history), decrypt,
                                     top_k=RETRIEVAL_K, min_score=MIN_RELEVANCE)
     if not hits:
         return result(NOT_FOUND_ANSWER, "not_found")
