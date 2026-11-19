@@ -2,8 +2,8 @@
 Shared fakes for the AI tutor tests.
 
 D1 is faked with a real in-memory SQLite database (run the worker's own DDL
-on it), Workers AI with a deterministic bag-of-words embedder plus a
-scriptable chat model, Vectorize with an in-memory namespace-aware cosine
+on it), Workers AI with a deterministic bag-of-words embedder and reranker
+plus scriptable chat and query-rewrite models, Vectorize with an in-memory namespace-aware cosine
 index, and R2 with a dict — so tests exercise real SQL and real ranking.
 """
 
@@ -55,11 +55,19 @@ class SqliteD1:
     def prepare(self, sql):
         return _Stmt(self.conn, sql)
 
+    async def batch(self, stmts):
+        with self.conn:   # one transaction, like D1
+            for st in stmts:
+                self.conn.execute(st.sql, st.args)
+
 
 _VOCAB = 256
 
 
 def _embed(text):
+    import tutor_rag
+    if text.startswith(tutor_rag.QUERY_INSTRUCTION):   # the instruction carries no content
+        text = text[len(tutor_rag.QUERY_INSTRUCTION):]
     vec = [0.0] * _VOCAB
     for word in re.findall(r"[a-z]+", text.lower()):
         if len(word) > 2:
@@ -72,13 +80,32 @@ class FakeAI:
     def __init__(self):
         self.calls = []
         self.chat_calls = []
+        self.expansion_calls = []
+        self.rerank_calls = []
         # Replace in a test to script the chat model; receives the messages.
         self.chat_responder = lambda messages: "From the course materials: see [1]."
+        # The query-rewrite model; by default it offers no rewrites.
+        self.expansion_responder = lambda messages: ""
+        # Replace to script the reranker: (query, texts) -> scores.
+        self.rerank_responder = None
 
     async def run(self, model, payload):
+        import tutor_chat
+        if "messages" in payload and model == tutor_chat.EXPANSION_MODEL:
+            self.expansion_calls.append((model, payload))
+            return {"response": self.expansion_responder(payload["messages"])}
         if "messages" in payload:   # chat model
             self.chat_calls.append((model, payload))
             return {"response": self.chat_responder(payload["messages"])}
+        if "contexts" in payload:   # reranker: cosine of the bag-of-words vectors
+            texts = [c["text"] for c in payload["contexts"]]
+            self.rerank_calls.append((model, payload["query"], texts))
+            if self.rerank_responder:
+                scores = self.rerank_responder(payload["query"], texts)
+            else:
+                q = _embed(payload["query"])
+                scores = [sum(a * b for a, b in zip(q, _embed(t))) for t in texts]
+            return {"response": [{"id": i, "score": sc} for i, sc in enumerate(scores)]}
         self.calls.append((model, list(payload["text"])))
         return {"shape": [len(payload["text"]), _VOCAB],
                 "data": [_embed(t) for t in payload["text"]]}

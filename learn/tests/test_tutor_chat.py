@@ -10,6 +10,7 @@ import pytest
 
 import tutor_chat
 import tutor_policy
+import tutor_rag
 from tests.helpers import MockRequest, load_worker
 from tests.tutor_fakes import FakeAI, FakeR2, FakeVectorize, SqliteD1
 
@@ -88,6 +89,37 @@ class TestRetrievalQuery:
         assert tutor_chat.retrieval_queries("Q", []) == ["Q"]
 
 
+class TestParseRewrites:
+    def test_numbering_quotes_and_preamble_are_removed(self):
+        reply = ('1. How do plants capture light energy?\n\n2) "Role of chlorophyll in photosynthesis"\n'
+                 '3. A passage answering this question might contain: "Chlorophyll absorbs light."')
+        assert tutor_chat.parse_rewrites(reply, "How do plants get energy?") == [
+            "How do plants capture light energy?", "Role of chlorophyll in photosynthesis",
+            "Chlorophyll absorbs light."]
+
+    def test_copies_of_the_question_and_extra_lines_are_dropped(self):
+        reply = "how do plants get energy?\nA\nB b\nC c\nD d\nB  B"
+        assert tutor_chat.parse_rewrites(reply, "How do plants get  energy?") == ["B b", "C c", "D d"]
+
+    def test_long_lines_are_cut(self):
+        assert [len(r) for r in tutor_chat.parse_rewrites("x" * 900, "q")] == [300]
+
+
+class TestRerankQuery:
+    HISTORY = [{"role": "user", "content": "What are alleles?"}, {"role": "assistant", "content": "Variants [1]."}]
+
+    def test_first_question_is_reranked_as_asked(self):
+        assert tutor_chat.rerank_query("What are alleles?", [], ["Gene variants"]) == "What are alleles?"
+
+    def test_follow_up_uses_its_stand_alone_rewrite(self):
+        assert tutor_chat.rerank_query("And dominant ones?", self.HISTORY,
+                                       ["What are dominant alleles?"]) == "What are dominant alleles?"
+
+    def test_follow_up_without_rewrites_adds_the_previous_question(self):
+        assert tutor_chat.rerank_query("And dominant ones?", self.HISTORY, []) == \
+            "What are alleles?\nAnd dominant ones?"
+
+
 class TestCitedFraction:
     @pytest.mark.parametrize("answer, expected", [
         ("Plants use chlorophyll to capture light [1]. They make glucose from it [2].", 1.0),
@@ -98,6 +130,47 @@ class TestCitedFraction:
     ])
     def test_fraction(self, answer, expected):
         assert tutor_chat.cited_fraction(answer) == expected
+
+
+class TestSaysSourcesLackAnswer:
+    # Real Llama 3.3 replies from the CRAG run, logged as answers before this check.
+    @pytest.mark.parametrize("answer", [
+        "The provided sources do not contain information about the total number of number one hits [1][2].",
+        "The current CEO of Salesforce is Marc Benioff [3]. However, the sources do not provide information "
+        "on his previous work experience.",
+        "Manchester City won the 2022/23 title [3]. However, the exact total number of English titles won by "
+        "Manchester City is not explicitly stated in the provided sources.",
+        "We can see his attempts in some seasons [1]. However, the provided sources [1] to [5] do not "
+        "explicitly state which seasons Steve Nash achieved this feat.",
+        "Over 40 million albums were sold [3]. Therefore, the total sales of the best-selling album cannot be "
+        "determined from the given sources.",
+        "There is no information about that [2].",
+        "According to the sources, there is no specific information about the 3 most watched Halloween "
+        "movies of all time [1][2][3][4][5].",
+        "Her LSAT score was 179 [3]. There is no mention of an ASAT test.",
+        "I couldn't find that in the sources [1].",
+    ])
+    def test_hedged(self, answer):
+        assert tutor_chat.says_sources_lack_answer(answer)
+
+    @pytest.mark.parametrize("answer", [
+        "The movie \"Tenet\" won the Oscar for Best Visual Effects in 2021 [5].",
+        "Mayon can be considered the most active, as it has the most recent eruption date [3].",
+        "The exact age of the fossil cannot be determined precisely [2].",   # course content, not a refusal
+        "Plants do not need light for the Calvin cycle [1].",
+        "Source [1] explains what the light reactions split. Which gas could be released?",
+    ])
+    def test_real_answers(self, answer):
+        assert not tutor_chat.says_sources_lack_answer(answer)
+
+
+class TestHasWords:
+    @pytest.mark.parametrize("answer, expected", [
+        ("[1]", False), ("[1][2].", False), (" [1, 2] ", False),
+        ("Tenet [5].", True), ("Yes [1].", True), ("1789 [2]", True),
+    ])
+    def test_has_words(self, answer, expected):
+        assert tutor_chat.has_words(answer) is expected
 
 
 class TestExtractReply:
@@ -210,8 +283,47 @@ class TestChatEndpoint:
         assert msgs[1]["content"] == "How do plants capture sunlight?"
         assert msgs[2]["content"] == "Chlorophyll [1]."
         # searched with the question alone (a new topic) and with the previous one (a follow-up)
-        assert env.AI.calls[-1][1] == ["And what do they make?",
-                                       "How do plants capture sunlight?\nAnd what do they make?"]
+        q = tutor_rag.QUERY_INSTRUCTION
+        assert env.AI.calls[-1][1] == [q + "And what do they make?",
+                                       q + "How do plants capture sunlight?\nAnd what do they make?"]
+
+    async def test_rewrites_are_searched_and_passages_reranked_against_the_question(self, worker, env, monkeypatch):
+        monkeypatch.setattr(tutor_chat, "MIN_RELEVANCE", 0.0)   # both passages are candidates
+        env.AI.rerank_responder = lambda q, texts: [0.9 if "glucose" in t else 0.2 for t in texts]
+        env.AI.expansion_responder = lambda msgs: "How do plants make glucose?\nPlant sugar production"
+        env.AI.chat_responder = lambda msgs: "Chlorophyll [1]."
+        status, body = await _chat(worker, env, "student1", "Where does plant food come from?")
+        assert status == 200 and body["data"]["outcome"] == "answered", body
+        [(_, payload)] = env.AI.expansion_calls
+        assert payload["messages"][-1]["content"] == "Question: Where does plant food come from?"
+        q = tutor_rag.QUERY_INSTRUCTION
+        assert env.AI.calls[-1][1] == [q + "Where does plant food come from?",
+                                       q + "How do plants make glucose?", q + "Plant sugar production"]
+        assert [query for _, query, _ in env.AI.rerank_calls] == ["Where does plant food come from?"]
+
+    async def test_rewrite_model_sees_only_the_students_questions(self, worker, env):
+        env.AI.chat_responder = lambda msgs: "Chlorophyll is the pigment [1]."
+        _, first = await _chat(worker, env, "student1", "How do plants capture sunlight?")
+        await _chat(worker, env, "student1", "And what do they make?", first["data"]["conversation_id"])
+        content = env.AI.expansion_calls[-1][1]["messages"][-1]["content"]
+        assert content == "Earlier question: How do plants capture sunlight?\nQuestion: And what do they make?"
+
+    async def test_reranker_failure_still_answers(self, worker, env):
+        def broken(q, texts):
+            raise RuntimeError("reranker down")
+        env.AI.rerank_responder = broken
+        env.AI.chat_responder = lambda msgs: "Plants capture sunlight with chlorophyll [1]."
+        status, body = await _chat(worker, env, "student1", "How do plants and cells capture sunlight?")
+        assert status == 200 and body["data"]["outcome"] == "answered", body
+        assert env.AI.rerank_calls
+
+    async def test_rewrite_model_failure_still_answers(self, worker, env):
+        def broken(msgs):
+            raise RuntimeError("model unavailable")
+        env.AI.expansion_responder = broken
+        env.AI.chat_responder = lambda msgs: "Plants capture sunlight with chlorophyll [1]."
+        status, body = await _chat(worker, env, "student1", "How do plants capture sunlight?")
+        assert status == 200 and body["data"]["outcome"] == "answered", body
 
     async def test_cannot_continue_someone_elses_conversation(self, worker, env):
         _, first = await _chat(worker, env, "student1", "How do plants capture sunlight?")
@@ -240,6 +352,28 @@ class TestChatEndpoint:
         assert body["data"]["citations"] == []
         system = env.AI.chat_calls[0][1]["messages"][0]["content"]
         assert "reply with exactly NOT_IN_COURSE" in system
+
+    async def test_hedged_reply_is_not_found_and_kept_for_the_teacher(self, worker, env):
+        hedge = "The sources do not say how fast photosynthesis is [1]. They only mention chlorophyll [1]."
+        env.AI.chat_responder = lambda msgs: hedge
+        _, body = await _chat(worker, env, "student1", "How fast is photosynthesis in plants?")
+        data = body["data"]
+        assert (data["outcome"], data["answer"], data["citations"]) == ("not_found", tutor_chat.NOT_FOUND_ANSWER, [])
+        row = await env.DB.prepare(
+            "SELECT outcome, withheld_encrypted FROM tutor_messages WHERE role='assistant'").first()
+        assert row.outcome == "not_found" and row.withheld_encrypted.startswith("v1:")
+
+    async def test_citation_markers_only_is_withheld(self, worker, env):
+        # Seen with Llama 3.1 8B in the CRAG run: the whole reply was "[1]".
+        env.AI.chat_responder = lambda msgs: "[1]"
+        _, body = await _chat(worker, env, "student1", "How do plants capture sunlight?")
+        assert body["data"]["outcome"] == "withheld"
+        assert body["data"]["answer"] == tutor_chat.NOT_FOUND_ANSWER
+
+    async def test_one_word_cited_answer_still_answers(self, worker, env):
+        env.AI.chat_responder = lambda msgs: "Chlorophyll [1]."
+        _, body = await _chat(worker, env, "student1", "What do plants capture sunlight with?")
+        assert body["data"]["outcome"] == "answered"
 
     async def test_invented_citation_only_is_withheld(self, worker, env):
         env.AI.chat_responder = lambda msgs: "Plants are green because of magic [4]."

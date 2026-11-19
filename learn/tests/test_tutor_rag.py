@@ -73,7 +73,7 @@ class TestBuildChunks:
         with pytest.raises(ValueError):
             tutor_rag.build_chunks("a", [{"source_type": "web", "source_id": "1", "text": "x"}])
 
-    def test_chunks_never_span_sections_and_carry_locator(self):
+    def test_slides_are_never_joined_and_carry_locator(self):
         src = [{"source_type": "material", "source_id": "m", "title": "Deck", "sections": [
             {"locator": "slide 1", "text": "Alpha."},
             {"locator": "slide 2", "text": "Beta."},
@@ -81,6 +81,33 @@ class TestBuildChunks:
         chunks = tutor_rag.build_chunks("a", src)
         assert [(c["locator"], c["text"], c["chunk_index"]) for c in chunks] == \
             [("slide 1", "Alpha.", 0), ("slide 2", "Beta.", 1)]
+
+    def test_short_section_joins_its_neighbour(self):
+        long_text = "Mitosis makes two identical cells. " * 12
+        src = [{"source_type": "material", "source_id": "m", "title": "Notes", "sections": [
+            {"locator": "section: Mitosis", "text": "## Mitosis\nCell division."},
+            {"locator": "section: Phases", "text": long_text},
+            {"locator": "section: Meiosis", "text": long_text.replace("Mitosis", "Meiosis")},
+        ]}]
+        chunks = tutor_rag.build_chunks("a", src)
+        assert [c["locator"] for c in chunks] == ["section: Mitosis – section: Phases", "section: Meiosis"]
+        assert chunks[0]["text"].startswith("## Mitosis Cell division. Mitosis makes")
+
+    def test_sections_too_big_to_share_a_chunk_stay_apart(self):
+        big = "Word " * 239   # 1,194 characters: fits one chunk, but not with "Short."
+        src = [{"source_type": "material", "source_id": "m", "title": "Notes", "sections": [
+            {"locator": "section: A", "text": "Short."}, {"locator": "section: B", "text": big}]}]
+        assert [c["locator"] for c in tutor_rag.build_chunks("a", src)] == ["section: A", "section: B"]
+
+    def test_repeated_text_is_indexed_once(self):
+        footer = "Home | Courses | Contact us | Privacy policy"
+        long_text = "Photosynthesis turns light into sugar. " * 20
+        src = [{"source_type": "material", "source_id": f"m{i}", "title": f"Page {i}", "sections": [
+            {"locator": "section: Body", "text": long_text.replace("sugar", f"sugar {i}")},
+            {"locator": "section: Footer", "text": footer * 10}]} for i in (1, 2)]
+        texts = [c["text"] for c in tutor_rag.build_chunks("a", src)]
+        assert sum(footer in t for t in texts) == 1
+        assert len(texts) == len(set(texts)) == 3
 
     def test_moving_text_to_another_slide_changes_hash(self):
         def chunk(locator):
@@ -297,6 +324,26 @@ BIO = [
 ]
 
 
+class TestCleanText:
+    @pytest.mark.parametrize("text, expected", [
+        ("See [the notes](https://x.org/notes) first.", "See the notes first."),
+        ("![Mitosis diagram](data:image/png;base64,AAAA) Phases", "Mitosis diagram Phases"),
+        ("[![logo](a.png)](https://x.org)", "logo"),
+        ("[Cell (biology)](https://en.wikipedia.org/wiki/Cell_(biology))", "Cell (biology)"),
+        ('[Home](/ "Go home") | [About](/about)', "Home | About"),
+        ("Submit at [https://forms.x.org/lab](https://forms.x.org/lab)", "Submit at https://forms.x.org/lab"),
+        ("Arrays use a[0] and (1, 2).", "Arrays use a[0] and (1, 2)."),
+    ])
+    def test_clean(self, text, expected):
+        assert tutor_rag.clean_text(text) == expected
+
+    def test_link_urls_are_not_indexed(self):
+        src = [{"source_type": "material", "source_id": "m", "title": "Page",
+                "text": "Read [chapter 2](https://example.org/very/long/path?id=1) on enzymes."}]
+        [chunk] = tutor_rag.build_chunks("a", src)
+        assert chunk["text"] == "Read chapter 2 on enzymes."
+
+
 class TestIndexAndRetrieve:
     async def test_first_index_embeds_everything(self, env):
         stats = await tutor_rag.index_activity(env, "bio", BIO, _identity)
@@ -365,6 +412,37 @@ class TestIndexAndRetrieve:
         hits = await tutor_rag.retrieve(env, "bio", "chlorophyll sunlight magnesium", _identity, top_k=10)
         assert hits and all(h["source_id"] in {"bio", "s1", "s2"} for h in hits)
 
+    async def test_reranker_reorders_more_candidates_than_it_returns(self, env):
+        await tutor_rag.index_activity(env, "bio", BIO, _identity)
+        env.AI.rerank_responder = lambda q, texts: [0.9 if "mitosis" in t.lower() else 0.1 for t in texts]
+        [hit] = await tutor_rag.retrieve(env, "bio", "chlorophyll sunlight", _identity, top_k=1,
+                                         rerank_query="How do cells divide?")
+        assert hit["source_id"] == "s2" and hit["rerank_score"] == 0.9
+        [(model, query, texts)] = env.AI.rerank_calls
+        assert (model, query, len(texts)) == (tutor_rag.RERANK_MODEL, "How do cells divide?", 3)
+        assert texts[0].startswith("Photosynthesis\n")   # passages carry their title, as when embedded
+
+    async def test_reranker_failure_keeps_vector_order(self, env):
+        await tutor_rag.index_activity(env, "bio", BIO, _identity)
+
+        def broken(q, texts):
+            raise RuntimeError("reranker down")
+        env.AI.rerank_responder = broken
+        [hit] = await tutor_rag.retrieve(env, "bio", "chlorophyll sunlight", _identity, top_k=1, rerank_query="q")
+        assert hit["source_id"] == "s1" and "rerank_score" not in hit
+
+    async def test_reranker_only_sees_passages_above_the_floor(self, env):
+        await tutor_rag.index_activity(env, "bio", BIO, _identity)
+        hits = await tutor_rag.retrieve(env, "bio", "chlorophyll sunlight carbon dioxide", _identity,
+                                        top_k=5, min_score=0.5, rerank_query="q")
+        assert [h["source_id"] for h in hits] == ["s1"]
+        assert env.AI.rerank_calls == []   # one candidate: nothing to reorder
+
+    async def test_no_reranking_unless_asked(self, env):
+        await tutor_rag.index_activity(env, "bio", BIO, _identity)
+        await tutor_rag.retrieve(env, "bio", "chlorophyll sunlight", _identity, top_k=2)
+        assert env.AI.rerank_calls == []
+
     async def test_retrieve_several_queries_keeps_each_chunks_best_score(self, env):
         await tutor_rag.index_activity(env, "bio", BIO, _identity)
         env.AI.calls.clear()
@@ -373,7 +451,8 @@ class TestIndexAndRetrieve:
         env.AI.calls.clear()
         both = await tutor_rag.retrieve(env, "bio", ["chlorophyll sunlight", "mitosis daughter cells"],
                                         _identity, top_k=3)
-        assert env.AI.calls == [(tutor_rag.EMBED_MODEL, ["chlorophyll sunlight", "mitosis daughter cells"])]
+        q = tutor_rag.QUERY_INSTRUCTION
+        assert env.AI.calls == [(tutor_rag.EMBED_MODEL, [q + "chlorophyll sunlight", q + "mitosis daughter cells"])]
         by_id = {h["chunk_id"]: h["score"] for h in both}
         assert by_id[plants["chunk_id"]] == plants["score"]
         assert by_id[cells["chunk_id"]] == cells["score"]
@@ -466,10 +545,10 @@ class TestTutorEndpoints:
         resp = await worker._dispatch(_req(worker, env, "POST", "/api/activities/act1/tutor/reindex", HOST), env)
         assert resp.status == 200, resp.body
         data = json.loads(resp.body)["data"]
-        # activity description + objectives, session, handout, pdf, 2 slides
-        # (the image and the link contribute no text)
+        # activity description + objectives (both short, so one chunk), session,
+        # handout, pdf, 2 slides (the image and the link contribute no text)
         assert {k: data[k] for k in ("chunks", "embedded", "unchanged", "removed")} == \
-            {"chunks": 7, "embedded": 7, "unchanged": 0, "removed": 0}
+            {"chunks": 6, "embedded": 6, "unchanged": 0, "removed": 0}
         assert sorted((f["material_id"], f["reason"]) for f in data["skipped_files"]) == [
             ("m3", "unsupported file type '.png'"),
             ("m4", "external links are not fetched"),
@@ -499,7 +578,7 @@ class TestTutorEndpoints:
     async def test_learning_objectives_are_searchable(self, worker, env):
         await _seed(worker, env)
         [hit] = await self._search(worker, env, "ribosomes+protein+synthesis")
-        assert (hit["source_type"], hit["locator"]) == ("activity", "learning objectives")
+        assert (hit["source_type"], hit["locator"]) == ("activity", "description – learning objectives")
         assert "ribosomes" in hit["text"]
 
     async def test_student_cannot_reindex(self, worker, env):

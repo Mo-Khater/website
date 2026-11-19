@@ -229,14 +229,52 @@ The `deviations` list in every report records these:
 
 ### What to improve
 
-1. **Refusals logged as answers:** treat an answer that says the sources don't cover the question as `not_found`, or add a `partial` outcome. This also affects the teacher's review log, not only the benchmark.
+1. **Refusals logged as answers:** treat an answer that says the sources don't cover the question as `not_found`, or add a `partial` outcome. This also affects the teacher's review log, not only the benchmark. **Fixed:** see the re-run below.
 2. **Retrieval recall:** 5 of 12 answers that were in the pages never reached the top 5 passages. Options: a larger `RETRIEVAL_K`, or keyword search alongside vectors for names and numbers.
    - **A hybrid prototype** (vectors plus BM25) was measured and then removed pending a security review; see `TUTOR.md` section 12.
    - Measured on retrieval alone, without the time suffix, it reached the top 5 in 8 of 12 questions, the same as vector search but on a different pair.
    - With 10 passages, it found 10 of 12 against 9 for vector search alone.
-3. **Duplicate passages:** identical text, such as repeated menus, takes several of the 5 slots. De-duplicate by text hash at retrieval.
-4. **Navigation and boilerplate chunks** outrank content. Filter them when chunking.
-5. **Citation-only answers:** an answer that was only "[1]" passed the citation check (seen with the 8B model). Require some text besides the markers.
+   - **Improved:** BGE's query instruction, a cross-encoder reranker and query expansion; see the 200-question results below.
+3. **Duplicate passages:** identical text, such as repeated menus, takes several of the 5 slots. De-duplicate by text hash at retrieval. **Fixed** when chunking: repeated chunks are indexed once.
+4. **Navigation and boilerplate chunks** outrank content. Filter them when chunking. **Mostly fixed:** link URLs are dropped (44% of chunks were mostly URL), and short sections join a neighbour.
+5. **Citation-only answers:** an answer that was only "[1]" passed the citation check (seen with the 8B model). Require some text besides the markers. **Fixed.**
+
+## Results: after fixing hedged and citation-only answers (2026-11-18)
+
+**What changed:** `tutor_chat.says_sources_lack_answer` turns cited replies that say the sources lack the answer into `not_found`, and `has_words` withholds replies that are only citation markers. The prompt is unchanged. The same 40 questions were run on the same model.
+
+| | Score | Correct | Don't know | Wrong |
+|---|---|---|---|---|
+| First run | −0.175 | 8 | 17 | 15 |
+| **After the fix** | **+0.050** | 8 | 26 | 6 |
+
+**The 6 still counted wrong:**
+- **Gold answer disagrees with the pages (1):** the tiger shark.
+- **Ambiguous question (1):** Grand Slam 2017.
+- **Partial list (1):** Southern Africa.
+- **False premise answered as asked (1):** Cádiz "yesterday".
+- **Two more hedges** that the detector didn't match in this run: "there is **no specific information** about…" (Halloween movies) and "There is **no mention of**…" (Elle's "ASAT" score, which the reply did correct to LSAT).
+
+**After this run, the pattern was widened** to cover those two phrasings. Re-scoring the saved answers with it:
+- Both become `not_found`.
+- No correct answer in either CRAG run, and none of the 88 eval-set answers, is flagged.
+
+That gives a **projected +0.100** (8 correct, 28 don't know, 4 wrong). This is not a fresh model run.
+
+**Other changes**
+- **Harvard vs Princeton** is now answered correctly.
+- **The credit-card interest question** was withheld this time. The model worded its calculation differently and left too many sentences uncited, so the existing citation check withheld it.
+
+**Eval set (same harness, run in-process):**
+
+| Policy | Committed code | With the hedge check |
+|---|---|---|
+| answer | 36/38 | 36/38 |
+| hint_only | 34/38 | 34/38 |
+
+The second column re-scores the first run's answers with the check applied. The prompt is the same, and the check flags none of the 88 answers, so nothing changes.
+
+A stricter prompt ("answer, or reply NOT_IN_COURSE") was also tried live and dropped: hint-only mode fell to 30/38 and 29/38, with 6–7 answers given away against 2.
 
 ## Tests
 
@@ -255,3 +293,62 @@ python3 -m pytest tests/test_tutor_crag.py -q
 ## Data licence
 
 CRAG is CC BY-NC 4.0. Keep the data and reports out of git; `crag/` is in `.gitignore`.
+
+## Retrieval improvements: 200 questions, retrieval only (2026-11-18)
+
+**What changed** (details in `TUTOR.md` sections 2 and 4):
+- Queries are embedded with BGE v1.5's query instruction.
+- The top 20 vector candidates are reordered by `@cf/baai/bge-reranker-base`.
+- Llama 3.1 8B writes up to 3 rewrites of the question, which add candidates.
+- Chunking drops link URLs, joins short sections to a neighbour, and indexes repeated chunks once.
+
+**How it was measured:** a larger sample, 200 questions from the same 400 CRAG examples (`crag_sample.py --n 200`). It is retrieval only: is a short gold answer in the 5 passages the model gets? This runs entirely on this machine and costs nothing. The embedding model and reranker run through fastembed; the local reranker matches Workers AI's scores. The rewrites come from Llama 3.1 8B through Ollama.
+
+| | Answer reaches the 5 passages (of 58) | Questions with no passage (of 200) |
+|---|---|---|
+| Before | 33 (57%) | 0 |
+| + query instruction | 41 | 2 |
+| + reranker | **47 (81%)** | 2 |
+| + query expansion | 46 | 2 |
+| + new chunking (all four; of 57) | 45 (79%) | 2 |
+| New chunking, vector only (of 57) | 43 | 0 |
+
+**What the numbers say:**
+- **The query instruction and the reranker** account for most of the gain.
+- **Query expansion:**
+  - At first it *lowered* the reranked result (44): answer-like rewrites outscored the question and pushed its candidates out of the reranker's 20.
+  - Now rewrites only add candidates, and expansion is about neutral here (one question lost).
+  - It helps where CRAG doesn't test: student wording and follow-ups (the eval set's "crossing over").
+- **The new chunking:** −57% chunks (45,383 → 19,290); a large gain for vector search alone; within noise with the reranker.
+
+**End to end, eval set, Llama 3.3 70B:**
+- **Answer mode: 37/38**, up from 36/38. "Crossing over" is now answered.
+- **Hint-only mode:** 14 of 14 before the run's neuron budget stopped it, including "cell-wall", which the committed code failed.
+
+The full CRAG run with the production model (answers and judge) is still to do, on a day with the free neuron allowance unused.
+
+
+## Results: with the new retrieval, end to end (2026-11-19)
+
+**Setup:** the same 40 questions and model as the earlier runs. Rewrites come from Llama 3.1 8B on Workers AI, and the reranker runs locally (same model and scores as Workers AI). The 4,500-neuron budget stopped the run after 38 questions (4,123 neurons, ~108 per question: the harness also calls the rewrite model a second time for its retrieval diagnostic).
+
+| Same 38 questions | Score | Correct | Don't know | Wrong |
+|---|---|---|---|---|
+| Before (hedge fix only, 2026-11-18) | +0.079 | 8 | 25 | 5 |
+| **New retrieval** | **+0.053** | **11** | 18 | 9 |
+
+The answer reached the 5 passages in 9 of the 12 questions where it is in the pages, against 7 before.
+
+**Better retrieval makes the tutor answer more often:** 20 answers against 13. Four questions went from "don't know" to correct (F1 champions, Manchester City's titles, TNL's dividends, the 76ers' record), and two wrong answers became "don't know" (Halloween movies, Cádiz). But it also answers more questions that it can't fully answer.
+
+**The 9 wrong, by cause:**
+- **Hedges the check didn't match (2):**
+  - "The Alabama River is 305 miles… However, it is **not explicitly stated as** the longest river in Alabama **in the provided sources**." The wrong river, flagged by the model itself.
+  - Hamburg: "**There is no information in the sources** that suggests Hamburg became the biggest city", after a correct correction. CRAG only accepts "invalid question" for false premises.
+- **Calculations on data the pages don't have (2, post-processing):** the Pixar average gross and the share of 2016 Adele was number one. The gold answers aren't in the pages.
+- **Ambiguous or judged harshly (2):**
+  - "Oscar for Best Visual Effects in 2021": *Tenet* (2021 ceremony), and now *Dune* (2021 films), which was correct before.
+  - The Rolling Stones' founders: the 5 gold names plus Ian Stewart, who was also a founding member.
+- **Carried over from the earlier runs (3):** the tiger shark (the gold disagrees with the pages), Grand Slam 2017 (ambiguous) and Southern Africa (partial list).
+
+**Conclusion:** retrieval is better: +3 correct, and the answer reaches the model more often. The score is about the same because the extra answers include risky ones. Two of the new wrongs are hedges in phrasings the hedge check doesn't know yet ("not explicitly stated … in the provided sources", "no information in the sources that…"). Catching them would give about +0.11 on these 38, but that is a projection, not a run.

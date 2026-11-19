@@ -18,14 +18,23 @@ Storage
 Citations
   Every chunk records its source (type, id, title) and a *locator* inside
   that source — "slide 7", "page 3", "section: Photosynthesis" — so the tutor
-  can say exactly where an answer came from. A chunk never spans two
-  sections, so its locator is always accurate.
+  can say exactly where an answer came from. A chunk spans two sections
+  only when they are short; its locator then names the first and the last.
+
+Chunking
+  Text is cleaned first: Markdown links keep their text but lose the URL,
+  images keep their alt text. Short sections (but not slides) join their
+  neighbours, so a heading's few lines aren't cut off from what follows. Sections are split
+  at paragraphs, then sentences, with some overlap. A chunk whose text
+  already appears elsewhere in the course (a repeated footer or menu) is
+  indexed once.
 
 Embeddings come from Workers AI (binding ``AI``).
 """
 
 import hashlib
 import io
+import json
 import posixpath
 import re
 import zipfile
@@ -40,12 +49,19 @@ EMBED_DIMENSIONS = 768
 
 CHUNK_MAX_CHARS = 1200
 CHUNK_OVERLAP_CHARS = 200
+MIN_SECTION_CHARS = 300          # a shorter section joins its neighbour
 MAX_CHUNKS_PER_ACTIVITY = 2000   # hard cap so one course can't run up the AI bill
 EMBED_BATCH_SIZE = 50
 UPSERT_BATCH_SIZE = 500
 SQL_IN_BATCH_SIZE = 50           # D1 allows at most 100 bound parameters
 MAX_QUERY_CHARS = 1000
 MAX_TOP_K = 20
+
+# BGE v1.5's instruction for short queries searching for passages
+QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
+RERANK_MODEL = "@cf/baai/bge-reranker-base"   # cross-encoder, $0.003 per M tokens
+RERANK_CANDIDATES = 20           # vector hits the reranker reorders
+RERANK_MAX_CHARS = 1600          # the reranker reads at most 512 tokens of query + passage
 
 SOURCE_TYPES = ("activity", "session", "material", "quiz_explanation")
 
@@ -63,6 +79,49 @@ class TutorNotConfigured(RuntimeError):
 _PARA_SPLIT_RE = re.compile(r"\n\s*\n")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 _WS_RE = re.compile(r"\s+")
+_SLIDE_RE = re.compile(r"slide \d", re.I)
+_MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
+_MD_LINK_RE = re.compile(r"\[([^\]]*)\]\((?:[^()\s]|\([^()\s]*\))*(?:\s+\"[^\"]*\")?\)")
+
+
+def clean_text(text: str) -> str:
+    """Drop the URLs of Markdown links and images, keeping their text.
+
+    Converted web pages and documents are full of links; the URLs swamp the
+    embedding of short passages and cost model tokens. A URL written out as
+    the link's text ("[https://...](https://...)") is kept.
+    """
+    text = _MD_IMAGE_RE.sub(lambda m: m.group(1), text or "")
+    return _MD_LINK_RE.sub(lambda m: m.group(1), text)
+
+
+def merge_short_sections(sections: List[Dict[str, str]], min_chars: int = MIN_SECTION_CHARS,
+                         max_chars: int = CHUNK_MAX_CHARS) -> List[Dict[str, str]]:
+    """Join a section shorter than *min_chars* to its neighbour when the two fit
+    in one chunk, so a short section keeps its context. The locator of a
+    joined section names the first and last: "section: Intro – section: Usage".
+
+    Slides are never joined: most slides are short, and "slide 7" is the
+    citation a student can look up."""
+    merged: List[Dict[str, str]] = []
+    for sec in sections:
+        text = (sec.get("text") or "").strip()
+        if not text:
+            continue
+        prev = merged[-1] if merged else None
+        slides = prev and (_SLIDE_RE.match(prev["last"]) or _SLIDE_RE.match(sec.get("locator") or ""))
+        if (prev and not slides and (len(prev["text"]) < min_chars or len(text) < min_chars)
+                and len(prev["text"]) + 2 + len(text) <= max_chars):
+            prev["text"] += "\n\n" + text
+            prev["last"] = sec.get("locator") or ""
+        else:
+            merged.append({"locator": sec.get("locator") or "", "last": sec.get("locator") or "", "text": text})
+    out = []
+    for sec in merged:
+        first, last = sec["locator"], sec["last"]
+        locator = first if first == last or not last else (f"{first} – {last}" if first else last)
+        out.append({"locator": locator[:120], "text": sec["text"]})
+    return out
 
 
 def chunk_text(text: str, max_chars: int = CHUNK_MAX_CHARS,
@@ -147,6 +206,7 @@ def build_chunks(activity_id: str, sources: List[Dict[str, Any]]) -> List[Dict[s
     numbered across the whole source, so ids stay unique.
     """
     out: List[Dict[str, Any]] = []
+    seen = set()   # normalised text of every chunk so far: each is indexed once
     for src in sources:
         source_type = str(src.get("source_type") or "")
         if source_type not in SOURCE_TYPES:
@@ -154,9 +214,15 @@ def build_chunks(activity_id: str, sources: List[Dict[str, Any]]) -> List[Dict[s
         source_id = str(src.get("source_id") or "")
         title = str(src.get("title") or "").strip()[:200]
         index = 0
-        for section in source_sections(src):
+        sections = [{"locator": sec["locator"], "text": clean_text(sec["text"])}
+                    for sec in source_sections(src)]
+        for section in merge_short_sections(sections):
             locator = section["locator"]
             for piece in chunk_text(section["text"]):
+                key = " ".join(piece.lower().split())
+                if key in seen:
+                    continue
+                seen.add(key)
                 out.append({
                     "id": chunk_id(activity_id, source_type, source_id, index),
                     "activity_id": activity_id,
@@ -548,29 +614,76 @@ async def index_activity(env, activity_id: str, sources: List[Dict[str, Any]],
 # Retrieval
 # ---------------------------------------------------------------------------
 
+async def embed_queries(env, queries: List[str]) -> List[List[float]]:
+    """Embed search queries. BGE v1.5 is trained to embed a short query with
+    this instruction in front, and passages without it."""
+    return await embed_texts(env, [QUERY_INSTRUCTION + q for q in queries])
+
+
+async def rerank(env, query: str, hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Reorder *hits* by a cross-encoder's judgement of how well each answers *query*.
+
+    Vector search compares two separately made embeddings; the reranker reads
+    the question and the passage together, so it can tell "mentions the same
+    topic" from "answers the question". Each hit gains ``rerank_score``.
+    """
+    if len(hits) < 2:
+        return hits
+    ai, _ = _bindings(env)
+    contexts = [{"text": embedding_input(h["source_title"], h["locator"], h["text"])[:RERANK_MAX_CHARS]}
+                for h in hits]
+    result = _py(await ai.run(RERANK_MODEL, _js({"query": query[:MAX_QUERY_CHARS], "contexts": contexts})))
+    scores = {}
+    for item in (result or {}).get("response") or []:
+        scores[int(item["id"])] = float(item["score"])
+    if set(scores) != set(range(len(hits))):
+        raise RuntimeError(f"reranker scored {len(scores)} of {len(hits)} passages")
+    for i, hit in enumerate(hits):
+        hit["rerank_score"] = round(scores[i], 4)
+    return sorted(hits, key=lambda h: h["rerank_score"], reverse=True)
+
+
+def _clean_queries(queries) -> List[str]:
+    queries = [queries] if isinstance(queries, str) else list(queries or [])
+    return list(dict.fromkeys(q for q in ((q or "").strip()[:MAX_QUERY_CHARS] for q in queries) if q))
+
+
 async def retrieve(env, activity_id: str, query: Union[str, List[str]], decrypt: Crypt,
-                   top_k: int = 5, min_score: float = 0.0) -> List[Dict[str, Any]]:
+                   top_k: int = 5, min_score: float = 0.0,
+                   rerank_query: Optional[str] = None,
+                   extra_queries: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """Return the activity's chunks most relevant to *query*, best first.
 
-    *query* may be a list of alternative queries (e.g. a question alone and
-    the question with the previous one for context). They are embedded in one
-    call, and each chunk keeps its best score across them.
+    *query* may be a list of alternative queries (e.g. the question, and the
+    question with the previous one for context). *extra_queries* (rewrites
+    of the question) each add their best *top_k* chunks as candidates. All
+    are embedded in one call; each chunk keeps its best score across them,
+    and only chunks scoring at least *min_score* for some query are kept.
+
+    With *rerank_query*, each of *query* contributes up to RERANK_CANDIDATES
+    candidates, and the reranker orders all candidates against that text;
+    the best *top_k* are kept. If the reranker fails, the vector order is
+    used. Rewrites only ever add candidates: answer-like rewrites score
+    higher than questions do, and when they shared one candidate list they
+    crowded out the question's own passages (CRAG: 44 vs 47 of 58).
 
     Each hit carries what a caller needs to cite it: source type/id/title,
     locator (e.g. "slide 7"), chunk index, text, and similarity score.
     """
     _, index = _bindings(env)
-    queries = [query] if isinstance(query, str) else list(query or [])
-    queries = list(dict.fromkeys(q for q in ((q or "").strip()[:MAX_QUERY_CHARS] for q in queries) if q))
+    queries = _clean_queries(query)
     if not queries:
         return []
+    extras = [q for q in _clean_queries(extra_queries) if q not in queries]
     top_k = max(1, min(int(top_k), MAX_TOP_K))
+    pool = max(top_k, RERANK_CANDIDATES) if rerank_query else top_k
+    depth = [pool] * len(queries) + [top_k] * len(extras)
 
     scores: Dict[str, float] = {}
-    for vector in await embed_texts(env, queries):
+    for vector, k in zip(await embed_queries(env, queries + extras), depth):
         result = _py(await index.query(
             _js(vector),
-            _js({"topK": top_k, "namespace": activity_id, "returnMetadata": "none"}),
+            _js({"topK": k, "namespace": activity_id, "returnMetadata": "none"}),
         ))
         for m in (result or {}).get("matches") or []:
             score = float(m.get("score") or 0.0)
@@ -579,15 +692,20 @@ async def retrieve(env, activity_id: str, query: Union[str, List[str]], decrypt:
     if not scores:
         return []
 
-    ids = sorted(scores, key=scores.get, reverse=True)[:top_k]
-    placeholders = ",".join("?" for _ in ids)
-    rows_res = await env.DB.prepare(
-        "SELECT id, source_type, source_id, source_title, locator, chunk_index, text_encrypted"
-        f" FROM tutor_chunks WHERE activity_id=? AND id IN ({placeholders})"
-    ).bind(activity_id, *ids).all()
+    ids = sorted(scores, key=scores.get, reverse=True)
+    if not rerank_query:
+        ids = ids[:top_k]
+    rows = []
+    for batch in _batches(ids, SQL_IN_BATCH_SIZE):
+        placeholders = ",".join("?" for _ in batch)
+        rows_res = await env.DB.prepare(
+            "SELECT id, source_type, source_id, source_title, locator, chunk_index, text_encrypted"
+            f" FROM tutor_chunks WHERE activity_id=? AND id IN ({placeholders})"
+        ).bind(activity_id, *batch).all()
+        rows.extend(rows_res.results or [])
 
     hits = []
-    for row in rows_res.results or []:
+    for row in rows:
         hits.append({
             "chunk_id": row.id,
             "source_type": row.source_type,
@@ -599,5 +717,9 @@ async def retrieve(env, activity_id: str, query: Union[str, List[str]], decrypt:
             "score": round(scores.get(row.id, 0.0), 4),
         })
     hits.sort(key=lambda h: h["score"], reverse=True)
-    return hits
-
+    if rerank_query and len(hits) > 1:
+        try:
+            hits = await rerank(env, rerank_query, hits)
+        except Exception as exc:   # a reranker outage shouldn't take the tutor down
+            print(json.dumps({"level": "warn", "where": "tutor_rag.rerank", "error": str(exc)[:200]}))
+    return hits[:top_k]
