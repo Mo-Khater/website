@@ -50,7 +50,7 @@
               </label>
             </div>
             <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">
-              <i class="fas fa-circle-info mr-1"></i>Hints-only is an instruction to the AI. It follows it most of the time but not always, so check the review log below.
+              <i class="fas fa-circle-info mr-1"></i>Each hint is checked for the answer's key words and rewritten if it gives the answer away. The check can miss an answer said in other words, so look at the review log below.
             </p>
           </fieldset>
 
@@ -121,6 +121,7 @@
               <option value="not_found">Not in materials</option>
               <option value="withheld">Withheld</option>
               <option value="refused_topic">Refused topic</option>
+              <option value="hint_replaced">Hint replaced</option>
             </select>
           </label>
         </div>
@@ -146,6 +147,7 @@
     not_found:     { label: 'Not in materials', cls: 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-200' },
     withheld:      { label: 'Withheld',         cls: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200' },
     refused_topic: { label: 'Refused topic',    cls: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-200' },
+    hint_replaced: { label: 'Hint replaced',    cls: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200' },
   };
 
   let topics = [];

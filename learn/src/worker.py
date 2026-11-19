@@ -5239,7 +5239,7 @@ async def api_tutor_put_policy(req, env, activity_ref: str):
     return ok({"activity_id": act.id, "policy": policy}, "Tutor settings saved")
 
 
-_TUTOR_OUTCOMES = ("answered", "not_found", "withheld", "refused_topic")
+_TUTOR_OUTCOMES = ("answered", "not_found", "withheld", "refused_topic", "hint_replaced")
 
 
 async def api_tutor_log(req, env, activity_ref: str):

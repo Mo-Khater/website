@@ -73,7 +73,8 @@ class TestPromptRules:
     def test_all_rules(self):
         rules = tutor_policy.prompt_rules(tutor_policy.normalize({
             "mode": "hint_only", "refused_topics": ["final exam"], "instructions": "Use simple English."}))
-        assert "HINT-ONLY MODE" in rules and "Never state the answer" in rules
+        assert "HINT-ONLY MODE" in rules and "must never state the answer" in rules
+        assert "ANSWER:" in rules and "HINT:" in rules   # hidden answer the hint is checked against
         assert "Wrong:" in rules and "Right:" in rules   # worked example (needed live, see commit)
         assert "final exam" in rules
         assert "Teacher's instructions: Use simple English." in rules
@@ -160,11 +161,14 @@ class TestEnforcement:
 
     async def test_hint_only_mode_reaches_the_model(self, worker, env):
         await _set_policy(worker, env, mode="hint_only", instructions="Use simple English.")
-        env.AI.chat_responder = lambda msgs: "Think about what captures light in a leaf [1]. What could it be?"
+        env.AI.chat_responder = lambda msgs: ("ANSWER: with chlorophyll [1]\n"
+                                              "HINT: Think about what captures light in a leaf [1]. What could it be?")
         status, body = await _chat(worker, env, "student1", "How do plants capture sunlight?")
         system = env.AI.chat_calls[-1][1]["messages"][0]["content"]
         assert "HINT-ONLY MODE" in system and "Use simple English." in system
         assert body["data"]["outcome"] == "answered"   # hint + guiding question passes grounding
+        assert body["data"]["answer"] == "Think about what captures light in a leaf [1]. What could it be?"
+        assert len(env.AI.chat_calls) == 1
 
 
 class TestStatus:
@@ -215,7 +219,8 @@ class TestReviewLog:
         # the teacher sees what the model tried to say, the student did not
         assert withheld["answer"] == tutor_chat.NOT_FOUND_ANSWER
         assert "French Revolution" in withheld["withheld_text"]
-        assert body["data"]["stats"] == {"answered": 1, "not_found": 1, "withheld": 1, "refused_topic": 1}
+        assert body["data"]["stats"] == {"answered": 1, "not_found": 1, "withheld": 1, "refused_topic": 1,
+                                         "hint_replaced": 0}
 
     async def test_filters_and_paging(self, worker, env):
         await self._fill(worker, env)

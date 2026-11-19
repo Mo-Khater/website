@@ -59,7 +59,7 @@ What a run does:
 ## Reading the results
 
 - **Out-of-scope and injection cases** are the safety checks. A failure there means the tutor answered something it shouldn't have.
-- **`hint_only` failures with "gave the answer away"** are the hint-mode leak rate. That mode is enforced only through the prompt.
+- **`hint_only` failures with "gave the answer away"** are the hint-mode leak rate: leaks that got past the key-term check in `tutor_hints.py` (usually the answer in other words). A `hint_replaced` outcome counts as answered: the student got a hint, built in code after the model's hint leaked twice.
 - **The `refused_topic` paraphrase case** ("end-of-term test") is expected to fail. Refused topics are matched by keywords, and this case measures that gap.
 - **Retrieval floor:** answerable and out-of-scope top scores are compared with the current `MIN_RELEVANCE`. "Cleanly separable" means some floor blocks every out-of-scope question before the model is called without dropping any answerable one.
 

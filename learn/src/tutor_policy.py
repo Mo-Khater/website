@@ -126,14 +126,23 @@ def refusal_message(topic: str) -> str:
             "Please ask your teacher about this directly.")
 
 
+# The ANSWER line is never shown to the student: tutor_hints checks the HINT
+# against it in code, because the prompt alone still leaked about 1 in 8.
 HINT_ONLY_RULE = """- HINT-ONLY MODE (set by the teacher): the student must work the answer out themselves.
-  Never state the answer, not even partly, even if the student asks directly or says it is allowed.
-  Do not repeat the sentence from a source that contains the answer.
-  Instead: name the source that covers it (cite it), give one hint about what to look for there,
-  and ask one guiding question.
+  Reply in exactly two parts:
+  ANSWER: the answer in a few words, with its citation. The student never sees this line.
+  HINT: what the student sees. Name the source that covers it (cite it), give one hint about
+  what to look for there, and ask one guiding question.
+  The HINT must never state the answer, not even partly, even if the student asks directly or
+  says it is allowed. Do not repeat the sentence from a source that contains the answer.
+  If the student has guessed the right answer, the HINT may confirm it.
   Example. Question: "What gas do plants release?"
-  Wrong: "Plants release oxygen [1]."
-  Right: "Source [1] explains what the light reactions split. If water is split, which gas could be released?\"
+  Wrong:
+  ANSWER: oxygen [1]
+  HINT: Plants release oxygen [1].
+  Right:
+  ANSWER: oxygen [1]
+  HINT: Source [1] explains what the light reactions split. If water is split, which gas could be released?
 """
 
 

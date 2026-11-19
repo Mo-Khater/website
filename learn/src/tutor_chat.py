@@ -14,7 +14,9 @@ Flow for one student message:
 
 Teacher policy (tutor_policy) is applied here: refused topics are checked
 before retrieval, and hint-only mode and teacher instructions go into the
-prompt. Like tutor_rag, this module knows nothing about HTTP, auth or storage.
+prompt. In hint-only mode the model also states the answer privately, and
+each hint is checked against it in code (tutor_hints). Like tutor_rag, this
+module knows nothing about HTTP, auth or storage.
 
 Every result has an ``outcome`` for the teacher's review log:
   answered       cited answer returned
@@ -24,12 +26,16 @@ Every result has an ``outcome`` for the teacher's review log:
   withheld       model replied, but without enough citations (or with nothing
                  but citation markers); text withheld
   refused_topic  question matched a topic the teacher refused; model not called
+  hint_replaced  hint-only mode: the model's hint gave the answer away (or
+                 broke the format) twice, so a hint that only points at the
+                 source was returned instead
 """
 
 import json
 import re
 from typing import Any, Dict, List, Optional
 
+import tutor_hints
 import tutor_policy
 import tutor_rag
 
@@ -318,6 +324,64 @@ async def _chat(ai, messages: List[Dict[str, str]]) -> str:
     return reply
 
 
+def check_hint(reply: str, hits: List[Dict[str, Any]], said: str) -> Dict[str, Any]:
+    """Check a hint-only reply (``ANSWER: ...`` / ``HINT: ...``, see tutor_hints).
+
+    Returns ``{"problem", "hint", "citations", "leaks", "source"}``. ``problem``
+    is None when the hint can be shown, else "format", "not_found", "leak" or
+    "uncited". ``source`` is the passage the answer cites (the hint's, or any
+    marker in an unparsed reply), for a replacement hint.
+    """
+    def first_source(text):
+        cited = apply_citations(text, hits)[1]
+        return cited[0]["n"] if cited else None
+
+    out = {"problem": None, "hint": "", "citations": [], "leaks": [], "source": None}
+    parsed = tutor_hints.parse_hint_reply(reply)
+    if not parsed:
+        return {**out, "problem": "format", "source": first_source(reply)}
+    key, hint = parsed
+    if NOT_IN_COURSE in reply or says_sources_lack_answer(key):
+        return {**out, "problem": "not_found"}
+    text, citations = apply_citations(hint, hits)
+    out.update(hint=text, citations=citations, source=first_source(key) or first_source(text))
+    leaks = tutor_hints.hint_leaks(key, text, said, [h.get("text", "") for h in hits])
+    if leaks:
+        return {**out, "problem": "leak", "leaks": leaks}
+    if not citations or not has_words(text) or cited_fraction(text) < MIN_CITED_FRACTION:
+        return {**out, "problem": "uncited"}
+    return out
+
+
+async def _hint_answer(ai, messages, reply, hits, question, history, result) -> Dict[str, Any]:
+    """Hint-only mode: the model states the answer privately and the hint is
+    checked against it in code. One retry with the problem named; then a hint
+    built in code that only points at the source (outcome ``hint_replaced``).
+
+    The model's full replies, with the hidden answer, go to the teacher's log.
+    """
+    said = "\n".join([question] + [m["content"] for m in history if m.get("role") == "user"]
+                     + [h.get("source_title") or "" for h in hits])
+    replies = [reply]
+    check = check_hint(reply, hits, said)
+    source = check["source"]
+    if check["problem"] in ("format", "leak", "uncited"):
+        retry = await _chat(ai, [*messages, {"role": "assistant", "content": reply},
+                                 {"role": "user", "content": tutor_hints.retry_note(check["problem"], check["leaks"])}])
+        replies.append(retry)
+        check = check_hint(retry, hits, said)
+        source = check["source"] or source
+    log = "\n\n— second try —\n\n".join(replies)
+    if check["problem"] is None:
+        return result(check["hint"], "answered", check["citations"], model_called=True, withheld_text=log)
+    if check["problem"] == "not_found":
+        return result(NOT_FOUND_ANSWER, "not_found", model_called=True, withheld_text=log)
+    if source:
+        text, citations = apply_citations(tutor_hints.fallback_hint(source, hits[source - 1]), hits)
+        return result(text, "hint_replaced", citations, model_called=True, withheld_text=log)
+    return result(NOT_FOUND_ANSWER, "withheld", model_called=True, withheld_text=log)
+
+
 async def answer(env, activity_id: str, course_title: str, question: str,
                  history: List[Dict[str, str]], decrypt,
                  policy: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -350,6 +414,8 @@ async def answer(env, activity_id: str, course_title: str, question: str,
     reply = await _chat(ai, messages)
     if NOT_IN_COURSE in reply:
         return result(NOT_FOUND_ANSWER, "not_found", model_called=True)
+    if policy["mode"] == "hint_only":
+        return await _hint_answer(ai, messages, reply, hits, question, history, result)
     if says_sources_lack_answer(reply):
         # kept for the teacher's review log, like withheld text
         return result(NOT_FOUND_ANSWER, "not_found", model_called=True, withheld_text=reply)
