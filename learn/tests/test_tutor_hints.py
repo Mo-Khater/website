@@ -4,10 +4,13 @@ tutor_chat.check_hint / the retry and replacement flow through the chat endpoint
 """
 
 import pytest
-
 import tutor_chat
 import tutor_hints
-from tests.test_tutor_chat import _chat, _hit, _req, env, worker  # noqa: F401
+from tests import test_tutor_chat
+from tests.test_tutor_chat import _chat, _hit, _req
+
+env = test_tutor_chat.env
+worker = test_tutor_chat.worker
 
 DIFFUSION = "Diffusion is passive and needs no energy from the cell. Active transport uses ATP."
 
@@ -21,21 +24,31 @@ class TestParseHintReply:
         reply = "**ANSWER:** oxygen [1]\n\n**Hint:** Look at [1].\nWhich gas could it be?"
         assert tutor_hints.parse_hint_reply(reply) == ("oxygen [1]", "Look at [1].\nWhich gas could it be?")
 
-    @pytest.mark.parametrize("reply", [
-        "Plants release oxygen [1].",
-        "HINT: Look at [1]. Which gas?",
-        "ANSWER: oxygen [1]",
-        "ANSWER:\nHINT: Look at [1].",
-    ])
+    @pytest.mark.parametrize(
+        "reply",
+        [
+            "Plants release oxygen [1].",
+            "HINT: Look at [1]. Which gas?",
+            "ANSWER: oxygen [1]",
+            "ANSWER:\nHINT: Look at [1].",
+        ],
+    )
     def test_missing_part(self, reply):
         assert tutor_hints.parse_hint_reply(reply) is None
 
 
 class TestStem:
-    @pytest.mark.parametrize("a,b", [
-        ("membrane", "membranes"), ("package", "packaging"), ("swell", "swelling"),
-        ("release", "released"), ("three", "3"), ("cell", "cells"),
-    ])
+    @pytest.mark.parametrize(
+        "a,b",
+        [
+            ("membrane", "membranes"),
+            ("package", "packaging"),
+            ("swell", "swelling"),
+            ("release", "released"),
+            ("three", "3"),
+            ("cell", "cells"),
+        ],
+    )
     def test_same_stem(self, a, b):
         assert tutor_hints.stem(a) == tutor_hints.stem(b)
 
@@ -45,10 +58,14 @@ class TestHintLeaks:
         assert tutor_hints.hint_leaks("oxygen [1]", "Plants release oxygen [1]. Right?", "What gas?") == ["oxygen"]
 
     def test_plural_and_number_words(self):
-        assert tutor_hints.hint_leaks("proteins [1]", "It builds a protein [1].",
-                                      "What do ribosomes make?") == ["proteins"]
-        assert tutor_hints.hint_leaks("3 sodium, 2 potassium [1]", "It moves three of one kind [1].",
-                                      "How many sodium and potassium ions per ATP?") == ["3"]
+        assert tutor_hints.hint_leaks("proteins [1]", "It builds a protein [1].", "What do ribosomes make?") == [
+            "proteins"
+        ]
+        assert tutor_hints.hint_leaks(
+            "3 sodium, 2 potassium [1]",
+            "It moves three of one kind [1].",
+            "How many sodium and potassium ions per ATP?",
+        ) == ["3"]
 
     def test_good_hint_does_not_leak(self):
         hint = "Source [1] explains what the light reactions split. If water is split, which gas could be released?"
@@ -56,21 +73,32 @@ class TestHintLeaks:
 
     def test_words_the_student_said_or_saw_are_not_leaks(self):
         assert tutor_hints.hint_leaks("oxygen [1]", "Yes, oxygen is right [1].", "Is it oxygen?") == []
-        assert tutor_hints.hint_leaks("in the nucleus of the cell [1]", "Which part of the cell [1]?",
-                                      "Where is DNA kept in a cell?") == []
+        assert (
+            tutor_hints.hint_leaks(
+                "in the nucleus of the cell [1]", "Which part of the cell [1]?", "Where is DNA kept in a cell?"
+            )
+            == []
+        )
 
     def test_stopwords_and_citations_are_not_key_terms(self):
         assert tutor_hints.key_terms("Yes, it is [1]") == {}
 
     def test_copied_answer_sentence(self):
-        leaks = tutor_hints.hint_leaks("No, diffusion is passive [1]",
-                                       "Source [1] says it needs no energy from the cell. So what does that mean?",
-                                       "Does diffusion need energy from the cell?", [DIFFUSION])
+        leaks = tutor_hints.hint_leaks(
+            "No, diffusion is passive [1]",
+            "Source [1] says it needs no energy from the cell. So what does that mean?",
+            "Does diffusion need energy from the cell?",
+            [DIFFUSION],
+        )
         assert leaks == ['"needs no energy from the cell"']
 
     def test_copying_other_sentences_is_fine(self):
-        leaks = tutor_hints.hint_leaks("passive [1]", "Compare with how active transport uses ATP [1]. Which needs it?",
-                                       "Is diffusion active?", [DIFFUSION])
+        leaks = tutor_hints.hint_leaks(
+            "passive [1]",
+            "Compare with how active transport uses ATP [1]. Which needs it?",
+            "Is diffusion active?",
+            [DIFFUSION],
+        )
         assert leaks == []
 
 
@@ -115,14 +143,17 @@ class TestCheckHint:
         assert c["problem"] == "not_found"
 
     def test_hedged_hint_is_not_a_refusal(self):
-        c = self.check("ANSWER: oxygen [1]\nHINT: The sources don't state it directly, but [1] says what is "
-                       "split. Which gas could be released?")
+        c = self.check(
+            "ANSWER: oxygen [1]\nHINT: The sources don't state it directly, but [1] says what is "
+            "split. Which gas could be released?"
+        )
         assert c["problem"] is None
 
 
 async def _hint_policy(worker, env):
-    resp = await worker._dispatch(_req(worker, env, "PUT", "/api/activities/act1/tutor/policy", "host1",
-                                       {"mode": "hint_only"}), env)
+    resp = await worker._dispatch(
+        _req(worker, env, "PUT", "/api/activities/act1/tutor/policy", "host1", {"mode": "hint_only"}), env
+    )
     assert resp.status == 200, resp.body
 
 
@@ -147,7 +178,7 @@ class TestHintEndpoint:
         assert data["answer"] == "Source [1] names a pigment in the leaf. What is it called?"
         assert "chlorophyll" not in data["answer"] and "ANSWER" not in data["answer"]
         assert len(env.AI.chat_calls) == 1
-        log = (await worker._dispatch(_req(worker, env, "GET", "/api/activities/act1/tutor/log", "host1"), env))
+        log = await worker._dispatch(_req(worker, env, "GET", "/api/activities/act1/tutor/log", "host1"), env)
         entry = __import__("json").loads(log.body)["data"]["entries"][0]
         assert "ANSWER: chlorophyll [1]" in entry["withheld_text"]
 
@@ -182,8 +213,9 @@ class TestHintEndpoint:
 
     async def test_a_right_guess_can_be_confirmed(self, worker, env):
         await _hint_policy(worker, env)
-        env.AI.chat_responder = _replies("ANSWER: chlorophyll [1]\nHINT: Yes, chlorophyll is right [1]. "
-                                         "Can you find where source [1] says so?")
+        env.AI.chat_responder = _replies(
+            "ANSWER: chlorophyll [1]\nHINT: Yes, chlorophyll is right [1]. " "Can you find where source [1] says so?"
+        )
         _, body = await _chat(worker, env, "student1", "Do plants capture sunlight with chlorophyll?")
         assert body["data"]["outcome"] == "answered"
         assert len(env.AI.chat_calls) == 1

@@ -61,8 +61,10 @@ _VOCAB = 256
 
 def _embed(text):
     import tutor_rag
+
     if text.startswith(tutor_rag.QUERY_INSTRUCTION):
-        text = text[len(tutor_rag.QUERY_INSTRUCTION):]
+        cut = len(tutor_rag.QUERY_INSTRUCTION)
+        text = text[cut:]
     vec = [0.0] * _VOCAB
     for word in re.findall(r"[a-z]+", text.lower()):
         if len(word) > 2:
@@ -85,6 +87,7 @@ class FakeAI:
 
     async def run(self, model, payload):
         import tutor_chat
+
         if "messages" in payload and payload["messages"][0]["content"] == tutor_chat.KEYWORD_PROMPT:
             self.keyword_calls.append((model, payload))
             return {"response": self.keyword_responder(payload["messages"])}
@@ -104,8 +107,7 @@ class FakeAI:
                 scores = [sum(a * b for a, b in zip(q, _embed(t))) for t in texts]
             return {"response": [{"id": i, "score": sc} for i, sc in enumerate(scores)]}
         self.calls.append((model, list(payload["text"])))
-        return {"shape": [len(payload["text"]), _VOCAB],
-                "data": [_embed(t) for t in payload["text"]]}
+        return {"shape": [len(payload["text"]), _VOCAB], "data": [_embed(t) for t in payload["text"]]}
 
     async def toMarkdown(self, docs):
         """Pretend conversion: a file whose bytes start with BROKEN fails."""
@@ -117,10 +119,13 @@ class FakeAI:
             else:
                 pages = raw.split("\f")
                 body = "\n".join(f"### Page {n}\n{text}" for n, text in enumerate(pages, start=1))
-                md = (f"# {d['name']}\n## Metadata\n- PDFFormatVersion=1.6\n- Producer=LibreOffice 7.3\n"
-                      f"## Contents\n{body}")
-                out.append({"name": d["name"], "mimetype": d["blob"].type,
-                            "format": "markdown", "tokens": 1, "data": md})
+                md = (
+                    f"# {d['name']}\n## Metadata\n- PDFFormatVersion=1.6\n- Producer=LibreOffice 7.3\n"
+                    f"## Contents\n{body}"
+                )
+                out.append(
+                    {"name": d["name"], "mimetype": d["blob"].type, "format": "markdown", "tokens": 1, "data": md}
+                )
         self.calls.append(("toMarkdown", [d["name"] for d in docs]))
         return out
 
@@ -161,7 +166,8 @@ class FakeVectorize:
         ns = opts.get("namespace")
         scored = [
             {"id": vid, "score": sum(a * b for a, b in zip(vector, vals))}
-            for (vns, vid), vals in self.vectors.items() if vns == ns
+            for (vns, vid), vals in self.vectors.items()
+            if vns == ns
         ]
         scored.sort(key=lambda m: m["score"], reverse=True)
         return {"count": len(scored), "matches": scored[: opts["topK"]]}

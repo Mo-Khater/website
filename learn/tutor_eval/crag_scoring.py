@@ -46,8 +46,9 @@ def gold_answers(example: Dict[str, Any]) -> List[str]:
     return [g for g in dict.fromkeys(g.strip() for g in golds) if g]
 
 
-def judge_messages(instructions: str, examples: str, query: str, ground_truth: str,
-                   prediction: str) -> List[Dict[str, str]]:
+def judge_messages(
+    instructions: str, examples: str, query: str, ground_truth: str, prediction: str
+) -> List[Dict[str, str]]:
     """The judge conversation, built exactly as CRAG's local_evaluation.py does."""
     return [
         {"role": "system", "content": instructions + "\n" + examples},
@@ -95,8 +96,11 @@ def score_prediction(query: str, golds: List[str], prediction: str, judge: Judge
         calls.append({"ground_truth": gold, **verdict})
         if verdict.get("score") == 1:
             return {"outcome": "correct", "how": "judge", "judge": calls}
-    how = "judge error" if calls and all(c.get("score") == -1 for c in calls) else (
-        "judge said no" if calls else "invalid rule")
+    how = (
+        "judge error"
+        if calls and all(c.get("score") == -1 for c in calls)
+        else ("judge said no" if calls else "invalid rule")
+    )
     return {"outcome": "hallucination", "how": how, "judge": calls}
 
 
@@ -104,7 +108,8 @@ def _rates(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     n = len(rows)
     counts = {o: sum(1 for r in rows if r["outcome"] == o) for o in OUTCOMES}
     return {
-        "n": n, **counts,
+        "n": n,
+        **counts,
         "score": round((counts["correct"] - counts["hallucination"]) / n, 3) if n else None,
         "accuracy": round(counts["correct"] / n, 3) if n else None,
         "hallucination_rate": round(counts["hallucination"] / n, 3) if n else None,

@@ -105,8 +105,9 @@ def clean_text(text: str) -> str:
     return _MD_LINK_RE.sub(lambda m: m.group(1), text)
 
 
-def merge_short_sections(sections: List[Dict[str, str]], min_chars: int = MIN_SECTION_CHARS,
-                         max_chars: int = CHUNK_MAX_CHARS) -> List[Dict[str, str]]:
+def merge_short_sections(
+    sections: List[Dict[str, str]], min_chars: int = MIN_SECTION_CHARS, max_chars: int = CHUNK_MAX_CHARS
+) -> List[Dict[str, str]]:
     """Join a section shorter than *min_chars* to its neighbour when the two fit
     in one chunk, so a short section keeps its context. The locator of a
     joined section names the first and last: "section: Intro – section: Usage".
@@ -120,8 +121,12 @@ def merge_short_sections(sections: List[Dict[str, str]], min_chars: int = MIN_SE
             continue
         prev = merged[-1] if merged else None
         slides = prev and (_SLIDE_RE.match(prev["last"]) or _SLIDE_RE.match(sec.get("locator") or ""))
-        if (prev and not slides and (len(prev["text"]) < min_chars or len(text) < min_chars)
-                and len(prev["text"]) + 2 + len(text) <= max_chars):
+        if (
+            prev
+            and not slides
+            and (len(prev["text"]) < min_chars or len(text) < min_chars)
+            and len(prev["text"]) + 2 + len(text) <= max_chars
+        ):
             prev["text"] += "\n\n" + text
             prev["last"] = sec.get("locator") or ""
         else:
@@ -134,8 +139,7 @@ def merge_short_sections(sections: List[Dict[str, str]], min_chars: int = MIN_SE
     return out
 
 
-def chunk_text(text: str, max_chars: int = CHUNK_MAX_CHARS,
-               overlap_chars: int = CHUNK_OVERLAP_CHARS) -> List[str]:
+def chunk_text(text: str, max_chars: int = CHUNK_MAX_CHARS, overlap_chars: int = CHUNK_OVERLAP_CHARS) -> List[str]:
     """Split *text* into chunks of at most *max_chars* characters.
 
     Paragraph boundaries are preferred, then sentence boundaries, then a hard
@@ -203,15 +207,18 @@ def embedding_input(source_title: str, locator: str, text: str) -> str:
 def source_sections(src: Dict[str, Any]) -> List[Dict[str, str]]:
     """A source is either ``{"text": ...}`` or ``{"sections": [{"locator", "text"}]}``."""
     if src.get("sections") is not None:
-        return [{"locator": str(sec.get("locator") or "")[:120], "text": str(sec.get("text") or "")}
-                for sec in src["sections"]]
+        return [
+            {"locator": str(sec.get("locator") or "")[:120], "text": str(sec.get("text") or "")}
+            for sec in src["sections"]
+        ]
     return [{"locator": "", "text": str(src.get("text") or "")}]
 
 
 def prepared_sections(src: Dict[str, Any]) -> List[Dict[str, str]]:
     """A source's sections as they are chunked: cleaned, short ones merged."""
-    return merge_short_sections([{"locator": sec["locator"], "text": clean_text(sec["text"])}
-                                 for sec in source_sections(src)])
+    return merge_short_sections(
+        [{"locator": sec["locator"], "text": clean_text(sec["text"])} for sec in source_sections(src)]
+    )
 
 
 def sentences_of(text: str, max_chars: int = CHUNK_MAX_CHARS) -> List[str]:
@@ -229,8 +236,9 @@ def sentences_of(text: str, max_chars: int = CHUNK_MAX_CHARS) -> List[str]:
     return out
 
 
-def pack_sentences(sentences: List[str], distances: List[float], min_chars: int = SEMANTIC_MIN_CHARS,
-                   max_chars: int = CHUNK_MAX_CHARS) -> List[str]:
+def pack_sentences(
+    sentences: List[str], distances: List[float], min_chars: int = SEMANTIC_MIN_CHARS, max_chars: int = CHUNK_MAX_CHARS
+) -> List[str]:
     """Group *sentences* into chunks of at most *max_chars*, each ending at the
     biggest change of topic once it has *min_chars*.
 
@@ -279,20 +287,24 @@ async def semantic_pieces(env, sources: List[Dict[str, Any]]) -> Dict[str, List[
             if len(sentences) < 2 or len(windows) + len(sentences) > MAX_SEMANTIC_SENTENCES:
                 continue
             plans.append((text, sentences, len(windows)))
-            windows += [" ".join(sentences[max(0, i - 1): i + 2]) for i in range(len(sentences))]
+            windows += [
+                " ".join(sentences[lo:hi]) for lo, hi in ((max(0, i - 1), i + 2) for i in range(len(sentences)))
+            ]
     if not windows:
         return {}
     vectors = await embed_texts(env, windows)
     pieces = {}
     for text, sentences, start in plans:
-        v = vectors[start: start + len(sentences)]
+        end = start + len(sentences)
+        v = vectors[start:end]
         distances = [_cosine_distance(v[i], v[i + 1]) for i in range(len(v) - 1)]
         pieces[text] = pack_sentences(sentences, distances)
     return pieces
 
 
-def build_chunks(activity_id: str, sources: List[Dict[str, Any]],
-                 pieces: Optional[Dict[str, List[str]]] = None) -> List[Dict[str, Any]]:
+def build_chunks(
+    activity_id: str, sources: List[Dict[str, Any]], pieces: Optional[Dict[str, List[str]]] = None
+) -> List[Dict[str, Any]]:
     """Turn source documents into chunk records.
 
     Each source is ``{"source_type", "source_id", "title"}`` plus either
@@ -318,17 +330,19 @@ def build_chunks(activity_id: str, sources: List[Dict[str, Any]],
                 if key in seen:
                     continue
                 seen.add(key)
-                out.append({
-                    "id": chunk_id(activity_id, source_type, source_id, index),
-                    "activity_id": activity_id,
-                    "source_type": source_type,
-                    "source_id": source_id,
-                    "source_title": title,
-                    "locator": locator,
-                    "chunk_index": index,
-                    "text": piece,
-                    "content_hash": content_hash(title, locator, piece),
-                })
+                out.append(
+                    {
+                        "id": chunk_id(activity_id, source_type, source_id, index),
+                        "activity_id": activity_id,
+                        "source_type": source_type,
+                        "source_id": source_id,
+                        "source_title": title,
+                        "locator": locator,
+                        "chunk_index": index,
+                        "text": piece,
+                        "content_hash": content_hash(title, locator, piece),
+                    }
+                )
                 index += 1
                 if len(out) >= MAX_CHUNKS_PER_ACTIVITY:
                     return out
@@ -337,7 +351,8 @@ def build_chunks(activity_id: str, sources: List[Dict[str, Any]],
 
 def _batches(items: List[Any], size: int):
     for i in range(0, len(items), size):
-        yield items[i:i + size]
+        end = i + size
+        yield items[i:end]
 
 
 def _js(obj):
@@ -428,7 +443,7 @@ def split_markdown_sections(markdown: str) -> Sections:
     page = None
 
     def flush():
-        body = "\n".join(l for l in lines if not _HEADING_RE.match(l.strip()))
+        body = "\n".join(line for line in lines if not _HEADING_RE.match(line.strip()))
         if body.strip():
             sections.append({"locator": locator, "text": "\n".join(lines).strip()})
 
@@ -458,8 +473,8 @@ def _is_metadata_section(section: Dict[str, str]) -> bool:
     (producer, creation date, PDF version...) — not course content."""
     if section["locator"] != "section: Metadata":
         return False
-    body = [l.strip() for l in section["text"].split("\n")[1:] if l.strip()]
-    return all(_METADATA_LINE_RE.match(l) for l in body)
+    body = [line.strip() for line in section["text"].split("\n")[1:] if line.strip()]
+    return all(_METADATA_LINE_RE.match(line) for line in body)
 
 
 _NS = {
@@ -538,8 +553,7 @@ def extract_pptx_sections(data: bytes) -> Sections:
                 if rel and rel[1] in names:
                     slides.append(rel[1])
         if not slides:
-            slides = sorted((n for n in names if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)),
-                            key=_slide_number)
+            slides = sorted((n for n in names if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)), key=_slide_number)
 
         sections: Sections = []
         for number, slide in enumerate(slides[:MAX_SLIDES], start=1):
@@ -594,8 +608,7 @@ async def extract_file_sections(env, bucket, key: str) -> Tuple[Sections, Option
         if doc.get("format") == "error":
             detail = str(doc.get("error") or doc.get("data") or "unknown error")[:200]
             return [], f"could not convert file: {detail}"
-        sections = [sec for sec in split_markdown_sections(str(doc.get("data") or ""))
-                    if not _is_metadata_section(sec)]
+        sections = [sec for sec in split_markdown_sections(str(doc.get("data") or "")) if not _is_metadata_section(sec)]
 
     sections = _cap_sections(sections)
     if not sections:
@@ -616,8 +629,7 @@ async def embed_texts(env, texts: List[str]) -> List[List[float]]:
     return vectors
 
 
-async def index_activity(env, activity_id: str, sources: List[Dict[str, Any]],
-                         encrypt: Crypt) -> Dict[str, int]:
+async def index_activity(env, activity_id: str, sources: List[Dict[str, Any]], encrypt: Crypt) -> Dict[str, int]:
     """Bring the activity's index in line with *sources*.
 
     Only chunks whose content hash changed are re-embedded; chunks whose
@@ -633,18 +645,16 @@ async def index_activity(env, activity_id: str, sources: List[Dict[str, Any]],
     desired = build_chunks(activity_id, sources, pieces)
     desired_ids = {c["id"] for c in desired}
 
-    existing_res = await env.DB.prepare(
-        "SELECT id, content_hash FROM tutor_chunks WHERE activity_id=?"
-    ).bind(activity_id).all()
+    existing_res = (
+        await env.DB.prepare("SELECT id, content_hash FROM tutor_chunks WHERE activity_id=?").bind(activity_id).all()
+    )
     existing = {row.id: row.content_hash for row in (existing_res.results or [])}
 
     changed = [c for c in desired if existing.get(c["id"]) != c["content_hash"]]
     stale = [cid for cid in existing if cid not in desired_ids]
 
     if changed:
-        vectors = await embed_texts(
-            env, [embedding_input(c["source_title"], c["locator"], c["text"]) for c in changed]
-        )
+        vectors = await embed_texts(env, [embedding_input(c["source_title"], c["locator"], c["text"]) for c in changed])
         records = [
             {
                 "id": c["id"],
@@ -670,17 +680,23 @@ async def index_activity(env, activity_id: str, sources: List[Dict[str, Any]],
                 "  content_hash=excluded.content_hash,"
                 "  updated_at=excluded.updated_at"
             ).bind(
-                c["id"], activity_id, c["source_type"], c["source_id"],
-                c["source_title"], c["locator"], c["chunk_index"],
-                await encrypt(c["text"]), c["content_hash"],
+                c["id"],
+                activity_id,
+                c["source_type"],
+                c["source_id"],
+                c["source_title"],
+                c["locator"],
+                c["chunk_index"],
+                await encrypt(c["text"]),
+                c["content_hash"],
             ).run()
 
     for batch in _batches(stale, SQL_IN_BATCH_SIZE):
         await index.deleteByIds(_js(batch))
         placeholders = ",".join("?" for _ in batch)
-        await env.DB.prepare(
-            f"DELETE FROM tutor_chunks WHERE activity_id=? AND id IN ({placeholders})"
-        ).bind(activity_id, *batch).run()
+        await env.DB.prepare(f"DELETE FROM tutor_chunks WHERE activity_id=? AND id IN ({placeholders})").bind(
+            activity_id, *batch
+        ).run()
 
     return {
         "chunks": len(desired),
@@ -706,8 +722,7 @@ async def rerank(env, query: str, hits: List[Dict[str, Any]]) -> List[Dict[str, 
     if len(hits) < 2:
         return hits
     ai, _ = _bindings(env)
-    contexts = [{"text": embedding_input(h["source_title"], h["locator"], h["text"])[:RERANK_MAX_CHARS]}
-                for h in hits]
+    contexts = [{"text": embedding_input(h["source_title"], h["locator"], h["text"])[:RERANK_MAX_CHARS]} for h in hits]
     result = _py(await ai.run(RERANK_MODEL, _js({"query": query[:MAX_QUERY_CHARS], "contexts": contexts})))
     scores = {}
     for item in (result or {}).get("response") or []:
@@ -747,7 +762,7 @@ def keyword_boost(hits: List[Dict[str, Any]], keywords: List[str], weight: float
     total = sum(idf)
     for hit, row in zip(hits, found):
         hit["keyword_coverage"] = round(sum(w for w, f in zip(idf, row) if f) / total, 4) if total else 0.0
-    base = lambda h: h["rerank_score"] if "rerank_score" in h else h.get("score", 0.0)   # noqa: E731
+    base = lambda h: h["rerank_score"] if "rerank_score" in h else h.get("score", 0.0)  # noqa: E731
     return sorted(hits, key=lambda h: base(h) + weight * h["keyword_coverage"], reverse=True)
 
 
@@ -756,12 +771,18 @@ def _clean_queries(queries) -> List[str]:
     return list(dict.fromkeys(q for q in ((q or "").strip()[:MAX_QUERY_CHARS] for q in queries) if q))
 
 
-async def retrieve(env, activity_id: str, query: Union[str, List[str]], decrypt: Crypt,
-                   top_k: int = 5, min_score: float = 0.0,
-                   rerank_query: Optional[str] = None,
-                   extra_queries: Optional[List[str]] = None,
-                   keywords: Optional[List[str]] = None,
-                   keyword_weight: float = 0.0) -> List[Dict[str, Any]]:
+async def retrieve(
+    env,
+    activity_id: str,
+    query: Union[str, List[str]],
+    decrypt: Crypt,
+    top_k: int = 5,
+    min_score: float = 0.0,
+    rerank_query: Optional[str] = None,
+    extra_queries: Optional[List[str]] = None,
+    keywords: Optional[List[str]] = None,
+    keyword_weight: float = 0.0,
+) -> List[Dict[str, Any]]:
     """Return the activity's chunks most relevant to *query*, best first.
 
     *query* may be a list of alternative queries, each searched as deeply
@@ -795,10 +816,12 @@ async def retrieve(env, activity_id: str, query: Union[str, List[str]], decrypt:
 
     scores: Dict[str, float] = {}
     for vector, k in zip(await embed_queries(env, queries + extras), depth):
-        result = _py(await index.query(
-            _js(vector),
-            _js({"topK": k, "namespace": activity_id, "returnMetadata": "none"}),
-        ))
+        result = _py(
+            await index.query(
+                _js(vector),
+                _js({"topK": k, "namespace": activity_id, "returnMetadata": "none"}),
+            )
+        )
         for m in (result or {}).get("matches") or []:
             score = float(m.get("score") or 0.0)
             if score >= min_score and score > scores.get(m["id"], -1.0):
@@ -812,24 +835,30 @@ async def retrieve(env, activity_id: str, query: Union[str, List[str]], decrypt:
     rows = []
     for batch in _batches(ids, SQL_IN_BATCH_SIZE):
         placeholders = ",".join("?" for _ in batch)
-        rows_res = await env.DB.prepare(
-            "SELECT id, source_type, source_id, source_title, locator, chunk_index, text_encrypted"
-            f" FROM tutor_chunks WHERE activity_id=? AND id IN ({placeholders})"
-        ).bind(activity_id, *batch).all()
+        rows_res = (
+            await env.DB.prepare(
+                "SELECT id, source_type, source_id, source_title, locator, chunk_index, text_encrypted"
+                f" FROM tutor_chunks WHERE activity_id=? AND id IN ({placeholders})"
+            )
+            .bind(activity_id, *batch)
+            .all()
+        )
         rows.extend(rows_res.results or [])
 
     hits = []
     for row in rows:
-        hits.append({
-            "chunk_id": row.id,
-            "source_type": row.source_type,
-            "source_id": row.source_id,
-            "source_title": row.source_title,
-            "locator": row.locator or "",
-            "chunk_index": row.chunk_index,
-            "text": await decrypt(row.text_encrypted or ""),
-            "score": round(scores.get(row.id, 0.0), 4),
-        })
+        hits.append(
+            {
+                "chunk_id": row.id,
+                "source_type": row.source_type,
+                "source_id": row.source_id,
+                "source_title": row.source_title,
+                "locator": row.locator or "",
+                "chunk_index": row.chunk_index,
+                "text": await decrypt(row.text_encrypted or ""),
+                "score": round(scores.get(row.id, 0.0), 4),
+            }
+        )
     hits.sort(key=lambda h: h["score"], reverse=True)
     if rerank_query and len(hits) > 1:
         try:

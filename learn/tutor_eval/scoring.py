@@ -117,8 +117,7 @@ def _rate(results: Iterable[Dict[str, Any]], check: Optional[str] = None) -> Dic
         good = sum(1 for r in results if r["score"]["checks"][check])
     else:
         good = sum(1 for r in results if r["score"]["pass"])
-    return {"passed": good, "total": len(results),
-            "rate": round(good / len(results), 3) if results else None}
+    return {"passed": good, "total": len(results), "rate": round(good / len(results), 3) if results else None}
 
 
 def summarize(results: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -140,13 +139,16 @@ def summarize(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         else:
             detail["key_facts"] = _rate(answerable, "key_facts")
         entry["answerable_checks"] = detail
-        entry["failures"] = [{"case": r["case"]["id"], "why": r["score"]["why"]} for r in rows if not r["score"]["pass"]]
+        entry["failures"] = [
+            {"case": r["case"]["id"], "why": r["score"]["why"]} for r in rows if not r["score"]["pass"]
+        ]
         summary[policy] = entry
     return summary
 
 
-def threshold_analysis(top_scores: Dict[str, Optional[float]], cases: List[Dict[str, Any]],
-                       current: float) -> Dict[str, Any]:
+def threshold_analysis(
+    top_scores: Dict[str, Optional[float]], cases: List[Dict[str, Any]], current: float
+) -> Dict[str, Any]:
     """How well a retrieval-score floor separates answerable from out-of-scope questions.
 
     *top_scores* maps case id -> best retrieval score (None if nothing came back).
@@ -170,10 +172,16 @@ def threshold_analysis(top_scores: Dict[str, Optional[float]], cases: List[Dict[
         "answerable": {"min": round(ans[0], 4), "median": round(median(ans), 4), "max": round(ans[-1], 4)},
         "out_of_scope": {"min": round(oos[0], 4), "median": round(median(oos), 4), "max": round(oos[-1], 4)},
         "current_floor": current,
-        "current": {"answerable_kept": sum(s >= current for s in ans), "out_of_scope_blocked": sum(s < current for s in oos),
-                    "accuracy": round(accuracy(current), 3)},
+        "current": {
+            "answerable_kept": sum(s >= current for s in ans),
+            "out_of_scope_blocked": sum(s < current for s in oos),
+            "accuracy": round(accuracy(current), 3),
+        },
         "best_floor": round(best, 4),
-        "best": {"answerable_kept": sum(s >= best for s in ans), "out_of_scope_blocked": sum(s < best for s in oos),
-                 "accuracy": round(accuracy(best), 3)},
+        "best": {
+            "answerable_kept": sum(s >= best for s in ans),
+            "out_of_scope_blocked": sum(s < best for s in oos),
+            "accuracy": round(accuracy(best), 3),
+        },
         "separable": ans[0] > oos[-1],
     }

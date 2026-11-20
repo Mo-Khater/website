@@ -15,14 +15,19 @@ def _judge(score=0):
     def judge(query, ground_truth, prediction):
         calls.append(ground_truth)
         return {"score": score, "explanation": "x"}
+
     judge.calls = calls
     return judge
 
 
 class TestPrediction:
     def test_answered_drops_citation_markers(self):
-        assert crag_scoring.prediction_from_response(
-            {"outcome": "answered", "answer": "Tenet won [1][2]. It was 2021 [3]."}) == "Tenet won. It was 2021."
+        assert (
+            crag_scoring.prediction_from_response(
+                {"outcome": "answered", "answer": "Tenet won [1][2]. It was 2021 [3]."}
+            )
+            == "Tenet won. It was 2021."
+        )
 
     def test_anything_but_answered_is_i_dont_know(self):
         for outcome in ("not_found", "withheld", "refused_topic", "error"):
@@ -45,10 +50,14 @@ class TestScorePrediction:
 
     def test_invalid_rule(self):
         judge = _judge(1)
-        assert crag_scoring.score_prediction("q", ["invalid question"], "This is an invalid question.",
-                                             judge)["outcome"] == "correct"
-        assert crag_scoring.score_prediction("q", ["invalid question"], "Hamburg, in 1871.",
-                                             judge)["outcome"] == "hallucination"
+        assert (
+            crag_scoring.score_prediction("q", ["invalid question"], "This is an invalid question.", judge)["outcome"]
+            == "correct"
+        )
+        assert (
+            crag_scoring.score_prediction("q", ["invalid question"], "Hamburg, in 1871.", judge)["outcome"]
+            == "hallucination"
+        )
         assert judge.calls == []
 
     def test_judge_tries_each_gold_answer(self):
@@ -64,8 +73,10 @@ class TestScorePrediction:
 
 class TestParseJudgeReply:
     def test_last_json_block(self):
-        assert crag_scoring.parse_judge_reply('Thinking {"score": 0} final: {"score": 1, "explanation": "ok"}') == \
-            {"score": 1, "explanation": "ok"}
+        assert crag_scoring.parse_judge_reply('Thinking {"score": 0} final: {"score": 1, "explanation": "ok"}') == {
+            "score": 1,
+            "explanation": "ok",
+        }
 
     def test_score_as_string(self):
         assert crag_scoring.parse_judge_reply('{"score": "1"}')["score"] == 1
@@ -76,14 +87,18 @@ class TestParseJudgeReply:
 
     def test_judge_messages_match_crag(self):
         msgs = crag_scoring.judge_messages("I", "E", "q?", "gt", "pred")
-        assert msgs == [{"role": "system", "content": "I\nE"},
-                        {"role": "user", "content": "Question: q?\n Ground truth: gt\n Prediction: pred\n"}]
+        assert msgs == [
+            {"role": "system", "content": "I\nE"},
+            {"role": "user", "content": "Question: q?\n Ground truth: gt\n Prediction: pred\n"},
+        ]
 
 
 class TestSummary:
     def test_score_is_correct_minus_hallucinated(self):
-        rows = [{"outcome": o, "question_type": t, "domain": "movie"} for o, t in
-                [("correct", "simple"), ("correct", "simple"), ("missing", "set"), ("hallucination", "set")]]
+        rows = [
+            {"outcome": o, "question_type": t, "domain": "movie"}
+            for o, t in [("correct", "simple"), ("correct", "simple"), ("missing", "set"), ("hallucination", "set")]
+        ]
         s = crag_scoring.summarize(rows)
         assert s["overall"]["score"] == 0.25
         assert s["overall"]["accuracy"] == 0.5 and s["overall"]["missing_rate"] == 0.25
@@ -119,14 +134,16 @@ class TestSample:
 class TestBudget:
     def test_workers_ai_call_refused_before_it_is_sent(self, tmp_path):
         import run_crag
-        ai = run_crag.LocalAI("workers-ai", "http://127.0.0.1:9", "unused", tmp_path / "cache.json",
-                              budget_neurons=50)
+
+        ai = run_crag.LocalAI("workers-ai", "http://127.0.0.1:9", "unused", tmp_path / "cache.json", budget_neurons=50)
         import pytest
+
         with pytest.raises(run_crag.BudgetExceeded):
             ai.chat([{"role": "user", "content": "x" * 4000}], max_tokens=350)
         assert ai.stats["chat_calls"] == 0
 
     def test_ollama_has_no_budget(self, tmp_path):
         import run_crag
+
         ai = run_crag.LocalAI("ollama", "http://127.0.0.1:9", "m", tmp_path / "cache.json")
         assert ai.neurons_left() == float("inf")

@@ -7,7 +7,6 @@ import json
 from pathlib import Path
 
 import pytest
-
 from tests.helpers import load_worker
 from tutor_eval import scoring
 from tutor_eval.run_eval import mint_token
@@ -16,12 +15,21 @@ DATASET = json.loads((Path(__file__).parent.parent / "tutor_eval" / "dataset.jso
 
 
 def _resp(answer="", outcome="answered", sources=()):
-    return {"answer": answer, "outcome": outcome,
-            "citations": [{"n": i + 1, "source_title": s} for i, s in enumerate(sources)]}
+    return {
+        "answer": answer,
+        "outcome": outcome,
+        "citations": [{"n": i + 1, "source_title": s} for i, s in enumerate(sources)],
+    }
 
 
-ANSWERABLE = {"id": "glycolysis", "kind": "answerable", "question": "Where does glycolysis happen?",
-              "expect_source": "Lesson 4", "key_facts": [["cytoplasm"]], "hint_leak": ["cytoplasm"]}
+ANSWERABLE = {
+    "id": "glycolysis",
+    "kind": "answerable",
+    "question": "Where does glycolysis happen?",
+    "expect_source": "Lesson 4",
+    "key_facts": [["cytoplasm"]],
+    "hint_leak": ["cytoplasm"],
+}
 
 
 class TestMatching:
@@ -62,9 +70,14 @@ class TestScoreCase:
         assert not s["pass"] and s["why"] == ["outcome was not_found"]
 
     def test_hint_only_leak(self):
-        leak = scoring.score_case(ANSWERABLE, _resp("It happens in the cytoplasm [1].", sources=["Lesson 4"]), "hint_only")
-        hint = scoring.score_case(ANSWERABLE, _resp("Look at [1]. Which part of the cell is outside the organelles?",
-                                                    sources=["Lesson 4"]), "hint_only")
+        leak = scoring.score_case(
+            ANSWERABLE, _resp("It happens in the cytoplasm [1].", sources=["Lesson 4"]), "hint_only"
+        )
+        hint = scoring.score_case(
+            ANSWERABLE,
+            _resp("Look at [1]. Which part of the cell is outside the organelles?", sources=["Lesson 4"]),
+            "hint_only",
+        )
         assert not leak["pass"] and leak["checks"]["no_leak"] is False
         assert hint["pass"] and hint["checks"]["asks_question"] is True
 
@@ -88,10 +101,18 @@ class TestSummaries:
     def test_summarize(self):
         oos = {"id": "o", "kind": "out_of_scope", "question": "q"}
         results = [
-            {"policy": "answer", "mode": "answer", "case": ANSWERABLE,
-             "score": scoring.score_case(ANSWERABLE, _resp("In the cytoplasm [1].", sources=["Lesson 4"]), "answer")},
-            {"policy": "answer", "mode": "answer", "case": oos,
-             "score": scoring.score_case(oos, _resp("x", "answered"), "answer")},
+            {
+                "policy": "answer",
+                "mode": "answer",
+                "case": ANSWERABLE,
+                "score": scoring.score_case(ANSWERABLE, _resp("In the cytoplasm [1].", sources=["Lesson 4"]), "answer"),
+            },
+            {
+                "policy": "answer",
+                "mode": "answer",
+                "case": oos,
+                "score": scoring.score_case(oos, _resp("x", "answered"), "answer"),
+            },
         ]
         s = scoring.summarize(results)["answer"]
         assert s["overall"] == {"passed": 1, "total": 2, "rate": 0.5}
@@ -100,8 +121,9 @@ class TestSummaries:
         assert s["failures"] == [{"case": "o", "why": ["answered an out-of-scope question (outcome answered)"]}]
 
     def test_threshold_analysis(self):
-        cases = [{"id": f"a{i}", "kind": "answerable"} for i in range(3)] + \
-                [{"id": f"o{i}", "kind": "out_of_scope"} for i in range(3)]
+        cases = [{"id": f"a{i}", "kind": "answerable"} for i in range(3)] + [
+            {"id": f"o{i}", "kind": "out_of_scope"} for i in range(3)
+        ]
         scores = {"a0": 0.80, "a1": 0.75, "a2": 0.62, "o0": 0.58, "o1": 0.55, "o2": None}
         t = scoring.threshold_analysis(scores, cases, current=0.5)
         assert t["separable"] is True
@@ -127,7 +149,9 @@ class TestDataset:
         """An answerable case is only fair if its facts appear in its source."""
         course = DATASET["course"]
         text_of = {s["title"]: s["description"] for s in course["sessions"]}
-        text_of[course["title"]] = " ".join([course["description"], course["learning_objectives"], course["prerequisites"]])
+        text_of[course["title"]] = " ".join(
+            [course["description"], course["learning_objectives"], course["prerequisites"]]
+        )
         for c in DATASET["cases"]:
             if c["kind"] == "answerable":
                 expected = c["expect_source"] if isinstance(c["expect_source"], list) else [c["expect_source"]]
@@ -136,6 +160,7 @@ class TestDataset:
 
     def test_policies_are_valid(self):
         import tutor_policy
+
         for name, policy in DATASET["policies"].items():
             assert tutor_policy.validate_update({}, policy)[1] == "", name
 

@@ -7,10 +7,13 @@ endpoints.
 import json
 
 import pytest
-
 import tutor_chat
 import tutor_policy
-from tests.test_tutor_chat import _chat, _req, env, worker  # noqa: F401
+from tests import test_tutor_chat
+from tests.test_tutor_chat import _chat, _req
+
+env = test_tutor_chat.env
+worker = test_tutor_chat.worker
 
 
 class TestValidateUpdate:
@@ -28,35 +31,41 @@ class TestValidateUpdate:
         policy, _ = tutor_policy.validate_update({}, {"refused_topics": ["  Final   exam ", "final exam", "", "Essay"]})
         assert policy["refused_topics"] == ["Final exam", "Essay"]
 
-    @pytest.mark.parametrize("body, fragment", [
-        ({"enabled": "yes"}, "enabled"),
-        ({"mode": "lecture"}, "mode"),
-        ({"refused_topics": "exam"}, "list"),
-        ({"refused_topics": ["x" * 101]}, "at most"),
-        ({"refused_topics": ["!!!"]}, "no words"),
-        ({"refused_topics": [f"t{i}" for i in range(21)]}, "at most 20"),
-        ({"daily_limit": -1}, "daily_limit"),
-        ({"daily_limit": 501}, "daily_limit"),
-        ({"daily_limit": True}, "daily_limit"),
-        ({"daily_limit": 2.5}, "daily_limit"),
-        ({"instructions": "x" * 1001}, "instructions"),
-        ({"instructions": 5}, "instructions"),
-    ])
+    @pytest.mark.parametrize(
+        "body, fragment",
+        [
+            ({"enabled": "yes"}, "enabled"),
+            ({"mode": "lecture"}, "mode"),
+            ({"refused_topics": "exam"}, "list"),
+            ({"refused_topics": ["x" * 101]}, "at most"),
+            ({"refused_topics": ["!!!"]}, "no words"),
+            ({"refused_topics": [f"t{i}" for i in range(21)]}, "at most 20"),
+            ({"daily_limit": -1}, "daily_limit"),
+            ({"daily_limit": 501}, "daily_limit"),
+            ({"daily_limit": True}, "daily_limit"),
+            ({"daily_limit": 2.5}, "daily_limit"),
+            ({"instructions": "x" * 1001}, "instructions"),
+            ({"instructions": 5}, "instructions"),
+        ],
+    )
     def test_rejects_bad_values(self, body, fragment):
         policy, problem = tutor_policy.validate_update({}, body)
         assert policy is None and fragment in problem
 
 
 class TestRefusedTopics:
-    @pytest.mark.parametrize("message, topics, expected", [
-        ("What are derivatives in calculus?", ["derivative"], "derivative"),
-        ("Give me the final exam answers", ["final exam"], "final exam"),
-        ("When is the final project due?", ["final exam"], None),
-        ("Is AI going to replace teachers?", ["AI"], "AI"),
-        ("Explain the main idea", ["AI"], None),
-        ("How do plants make glucose?", ["exam", "essay"], None),
-        ("Help with my ESSAY please", ["exam", "essay"], "essay"),
-    ])
+    @pytest.mark.parametrize(
+        "message, topics, expected",
+        [
+            ("What are derivatives in calculus?", ["derivative"], "derivative"),
+            ("Give me the final exam answers", ["final exam"], "final exam"),
+            ("When is the final project due?", ["final exam"], None),
+            ("Is AI going to replace teachers?", ["AI"], "AI"),
+            ("Explain the main idea", ["AI"], None),
+            ("How do plants make glucose?", ["exam", "essay"], None),
+            ("Help with my ESSAY please", ["exam", "essay"], "essay"),
+        ],
+    )
     def test_matching(self, message, topics, expected):
         assert tutor_policy.matched_refused_topic(message, topics) == expected
 
@@ -66,8 +75,11 @@ class TestPromptRules:
         assert tutor_policy.prompt_rules(tutor_policy.normalize({})) == ""
 
     def test_all_rules(self):
-        rules = tutor_policy.prompt_rules(tutor_policy.normalize({
-            "mode": "hint_only", "refused_topics": ["final exam"], "instructions": "Use simple English."}))
+        rules = tutor_policy.prompt_rules(
+            tutor_policy.normalize(
+                {"mode": "hint_only", "refused_topics": ["final exam"], "instructions": "Use simple English."}
+            )
+        )
         assert "HINT-ONLY MODE" in rules and "must never state the answer" in rules
         assert "ANSWER:" in rules and "HINT:" in rules
         assert "Wrong:" in rules and "Right:" in rules
@@ -75,8 +87,15 @@ class TestPromptRules:
         assert "Teacher's instructions: Use simple English." in rules
 
     def test_rules_reach_the_system_prompt(self):
-        hit = {"chunk_id": "c", "source_type": "session", "source_id": "s", "source_title": "T",
-               "locator": "", "text": "x", "score": 0.9}
+        hit = {
+            "chunk_id": "c",
+            "source_type": "session",
+            "source_id": "s",
+            "source_title": "T",
+            "locator": "",
+            "text": "x",
+            "score": 0.9,
+        }
         msgs = tutor_chat.build_messages("C", [hit], [], "q", {"mode": "hint_only"})
         assert "HINT-ONLY MODE" in msgs[0]["content"]
         assert msgs[0]["content"].index("HINT-ONLY") < msgs[0]["content"].index("Sources:")
@@ -104,8 +123,13 @@ class TestPolicyEndpoints:
         assert status == 200 and body["data"]["policy"]["enabled"] is True
         assert body["data"]["limits"]["modes"] == ["answer", "hint_only"]
         policy = await _set_policy(worker, env, mode="hint_only", refused_topics=["final exam"])
-        assert policy == {"enabled": True, "mode": "hint_only", "refused_topics": ["final exam"],
-                          "daily_limit": 30, "instructions": ""}
+        assert policy == {
+            "enabled": True,
+            "mode": "hint_only",
+            "refused_topics": ["final exam"],
+            "daily_limit": 30,
+            "instructions": "",
+        }
 
     async def test_invalid_update_is_rejected_and_not_saved(self, worker, env):
         status, body = await _call(worker, env, "PUT", "/policy", "host1", {"mode": "lecture"})
@@ -151,8 +175,9 @@ class TestEnforcement:
 
     async def test_hint_only_mode_reaches_the_model(self, worker, env):
         await _set_policy(worker, env, mode="hint_only", instructions="Use simple English.")
-        env.AI.chat_responder = lambda msgs: ("ANSWER: with chlorophyll [1]\n"
-                                              "HINT: Think about what captures light in a leaf [1]. What could it be?")
+        env.AI.chat_responder = lambda msgs: (
+            "ANSWER: with chlorophyll [1]\n" "HINT: Think about what captures light in a leaf [1]. What could it be?"
+        )
         status, body = await _chat(worker, env, "student1", "How do plants capture sunlight?")
         system = env.AI.chat_calls[-1][1]["messages"][0]["content"]
         assert "HINT-ONLY MODE" in system and "Use simple English." in system
@@ -169,8 +194,12 @@ class TestStatus:
         assert status == 200
         data = body["data"]
         assert (data["enabled"], data["available"], data["is_host"]) == (True, True, False)
-        assert (data["mode"], data["daily_limit"], data["used_today"], data["remaining_today"]) == \
-            ("hint_only", 5, 1, 4)
+        assert (data["mode"], data["daily_limit"], data["used_today"], data["remaining_today"]) == (
+            "hint_only",
+            5,
+            1,
+            4,
+        )
         assert "teacher can read" in data["notice"]
 
     async def test_disabled_but_host_can_preview(self, worker, env):
@@ -208,8 +237,13 @@ class TestReviewLog:
         assert answered["withheld_text"] is None
         assert withheld["answer"] == tutor_chat.NOT_FOUND_ANSWER
         assert "French Revolution" in withheld["withheld_text"]
-        assert body["data"]["stats"] == {"answered": 1, "not_found": 1, "withheld": 1, "refused_topic": 1,
-                                         "hint_replaced": 0}
+        assert body["data"]["stats"] == {
+            "answered": 1,
+            "not_found": 1,
+            "withheld": 1,
+            "refused_topic": 1,
+            "hint_replaced": 0,
+        }
 
     async def test_filters_and_paging(self, worker, env):
         await self._fill(worker, env)

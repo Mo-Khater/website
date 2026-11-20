@@ -5112,9 +5112,8 @@ async def api_tutor_chat(req, env, activity_ref: str):
         await capture_exception(exc, req, env, "api_tutor_chat.answer")
         return err("The tutor is unavailable right now — please try again", 502)
 
-    stored_citations = json.dumps([{k: c[k] for k in ("n", "chunk_id", "source_type", "source_id",
-                                                        "source_title", "locator")}
-                                   for c in result["citations"]])
+    citation_fields = ("n", "chunk_id", "source_type", "source_id", "source_title", "locator")
+    stored_citations = json.dumps([{k: c[k] for k in citation_fields} for c in result["citations"]])
     # Python None reaches D1 as JS undefined, which bind() rejects, so the
     # user row's empty columns are SQL NULL literals rather than bound values.
     insert = ("INSERT INTO tutor_messages (id, conversation_id, activity_id, user_id, role,"
@@ -5257,7 +5256,10 @@ async def api_tutor_log(req, env, activity_ref: str):
         return error_resp
 
     params = parse_qs(urlparse(req.url).query)
-    arg = lambda name: (params.get(name) or [""])[0].strip()
+
+    def arg(name):
+        return (params.get(name) or [""])[0].strip()
+
     try:
         limit = max(1, min(int(arg("limit") or 50), 100))
     except ValueError:

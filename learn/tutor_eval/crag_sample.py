@@ -25,10 +25,19 @@ import urllib.request
 from collections import Counter, defaultdict
 from pathlib import Path
 
-DATA_URL = ("https://media.githubusercontent.com/media/facebookresearch/CRAG/main/"
-            "data/crag_task_1_and_2_dev_v4.jsonl.bz2")
-QUESTION_TYPES = ("simple", "simple_w_condition", "comparison", "aggregation", "set",
-                  "multi-hop", "post-processing", "false_premise")
+DATA_URL = (
+    "https://media.githubusercontent.com/media/facebookresearch/CRAG/main/" "data/crag_task_1_and_2_dev_v4.jsonl.bz2"
+)
+QUESTION_TYPES = (
+    "simple",
+    "simple_w_condition",
+    "comparison",
+    "aggregation",
+    "set",
+    "multi-hop",
+    "post-processing",
+    "false_premise",
+)
 DOMAINS = ("finance", "sports", "music", "movie", "open")
 
 
@@ -55,8 +64,11 @@ def stream_examples(url: str, max_examples: int):
 def usable(example) -> bool:
     """Has a question, a gold answer, and at least one page with HTML."""
     pages = example.get("search_results") or []
-    return bool(example.get("query") and str(example.get("answer", "")).strip()
-                and any((p.get("page_result") or "").strip() for p in pages))
+    return bool(
+        example.get("query")
+        and str(example.get("answer", "")).strip()
+        and any((p.get("page_result") or "").strip() for p in pages)
+    )
 
 
 def balanced_pick(pool, n: int):
@@ -69,7 +81,8 @@ def balanced_pick(pool, n: int):
     for i, qtype in enumerate(order):
         by_domain = by_type[qtype]
         domains = sorted(by_domain, key=lambda d: (d not in DOMAINS, d))
-        domains = domains[i % len(domains):] + domains[:i % len(domains)]
+        k = i % len(domains)
+        domains = domains[k:] + domains[:k]
         queues = [by_domain[d] for d in domains]
         per_type[qtype] = [ex for group in itertools.zip_longest(*queues) for ex in group if ex]
     picked = []
@@ -88,8 +101,12 @@ def balanced_pick(pool, n: int):
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--n", type=int, default=20, help="questions in the sample")
-    p.add_argument("--scan", type=int, default=400,
-                   help="how many CRAG examples to read before picking (more = better balance, bigger download)")
+    p.add_argument(
+        "--scan",
+        type=int,
+        default=400,
+        help="how many CRAG examples to read before picking (more = better balance, bigger download)",
+    )
     p.add_argument("--url", default=DATA_URL)
     p.add_argument("--out", default="crag/sample.jsonl")
     args = p.parse_args(argv)

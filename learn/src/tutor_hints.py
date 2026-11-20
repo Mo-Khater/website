@@ -36,18 +36,32 @@ _TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 _FIELD_RE = re.compile(r"^[\s*_#>-]*(ANSWER|HINT)[\s*_]*:[\s*_]*", re.IGNORECASE | re.MULTILINE)
 
-STOPWORDS = frozenset("""
+STOPWORDS = frozenset(
+    """
 a about after all also an and any are as at be because been before both but by can could
 did do does each for from had has have here how if in inside into is it its may might more
 most much must no nor not of on only or other our out over per same should so some such than
 that the their them then there these they this those through to too under up very was were
 what when where which while who whom why will with within would yes you your
 answer answers called known part source sources use used uses
-""".split())
+""".split()
+)
 
-NUMBER_WORDS = {"zero": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
-                "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
-                "eleven": "11", "twelve": "12"}
+NUMBER_WORDS = {
+    "zero": "0",
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+    "ten": "10",
+    "eleven": "11",
+    "twelve": "12",
+}
 
 
 def _words(text: str) -> List[str]:
@@ -60,7 +74,7 @@ def stem(word: str) -> str:
     word = NUMBER_WORDS.get(word, word)
     for suffix in ("ing", "es", "ed", "s", "e"):
         if len(word) > len(suffix) + 3 and word.endswith(suffix):
-            return word[:-len(suffix)]
+            return word[: -len(suffix)]
     return word
 
 
@@ -94,10 +108,11 @@ def copied_run(hint: str, sentences: Iterable[str], exempt: Iterable[str] = ()) 
     runs = set()
     for sentence in sentences:
         words = [stem(w) for w in _words(sentence)]
-        runs.update(tuple(words[i:i + COPY_RUN_WORDS]) for i in range(len(words) - COPY_RUN_WORDS + 1))
+        runs.update(zip(*(words[k:] for k in range(COPY_RUN_WORDS))))
     words = _words(hint)
     for i in range(len(words) - COPY_RUN_WORDS + 1):
-        run = words[i:i + COPY_RUN_WORDS]
+        end = i + COPY_RUN_WORDS
+        run = words[i:end]
         stems = tuple(stem(w) for w in run)
         if stems in runs and not set(stems) <= exempt:
             return " ".join(run)
@@ -115,8 +130,12 @@ def hint_leaks(answer: str, hint: str, said: str, passages: Iterable[str] = ()) 
     terms = key_terms(answer, exempt)
     hint_stems = {stem(w) for w in _words(hint)}
     leaks = [word for s, word in terms.items() if s in hint_stems]
-    answer_sentences = [s for p in passages for s in _SENTENCE_RE.split(p or "")
-                        if terms and {stem(w) for w in _words(s)} & terms.keys()]
+    answer_sentences = [
+        s
+        for p in passages
+        for s in _SENTENCE_RE.split(p or "")
+        if terms and {stem(w) for w in _words(s)} & terms.keys()
+    ]
     copied = copied_run(hint, answer_sentences, exempt)
     if copied:
         leaks.append(f'"{copied}"')
@@ -124,23 +143,24 @@ def hint_leaks(answer: str, hint: str, said: str, passages: Iterable[str] = ()) 
 
 
 RETRY_NOTES = {
-    "leak": ("Your HINT gives the answer away: it says {leaks}. Write both lines again. "
-             "The HINT must not use those words or copy the source's sentence; "
-             "point to the source and ask a guiding question instead."),
-    "format": ("Reply in the required format: one line that starts with ANSWER: "
-               "and one that starts with HINT:."),
+    "leak": (
+        "Your HINT gives the answer away: it says {leaks}. Write both lines again. "
+        "The HINT must not use those words or copy the source's sentence; "
+        "point to the source and ask a guiding question instead."
+    ),
+    "format": ("Reply in the required format: one line that starts with ANSWER: " "and one that starts with HINT:."),
     "uncited": "The HINT must cite the source it points to, like [1]. Write both lines again.",
 }
 
 
 def retry_note(problem: str, leaks: Iterable[str] = ()) -> str:
     """Feedback for the model's second try; marked so it isn't taken as the student's words."""
-    return ("(Automatic check by the tutor system, not a message from the student.) "
-            + RETRY_NOTES[problem].format(leaks=", ".join(leaks)))
+    return "(Automatic check by the tutor system, not a message from the student.) " + RETRY_NOTES[problem].format(
+        leaks=", ".join(leaks)
+    )
 
 
 def fallback_hint(n: int, hit: Dict) -> str:
     """A hint that can't give anything away: it only points at source [n]."""
     where = " — ".join(p for p in (hit.get("source_title"), hit.get("locator")) if p)
-    return (f"Source [{n}] ({where}) covers this. "
-            "Read that part again: which sentence answers your question?")
+    return f"Source [{n}] ({where}) covers this. " "Read that part again: which sentence answers your question?"

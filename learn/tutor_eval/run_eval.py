@@ -34,9 +34,11 @@ HERE = Path(__file__).resolve().parent
 def mint_token(user_id: str, secret: str, role: str = "member", ttl: int = 6 * 3600) -> str:
     """Same format as worker.create_token (HMAC-SHA256 signed, base64 JSON payload)."""
     now = int(time.time())
-    payload = base64.b64encode(json.dumps(
-        {"id": user_id, "username": user_id, "role": role, "iat": now, "exp": now + ttl},
-        separators=(",", ":")).encode()).decode()
+    payload = base64.b64encode(
+        json.dumps(
+            {"id": user_id, "username": user_id, "role": role, "iat": now, "exp": now + ttl}, separators=(",", ":")
+        ).encode()
+    ).decode()
     return payload + "." + hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
 
 
@@ -46,10 +48,11 @@ class Client:
 
     def call(self, method, path, token=None, body=None, timeout=180):
         req = urllib.request.Request(
-            self.base + path, method=method,
+            self.base + path,
+            method=method,
             data=json.dumps(body).encode() if body is not None else None,
-            headers={"Content-Type": "application/json",
-                     **({"Authorization": f"Bearer {token}"} if token else {})})
+            headers={"Content-Type": "application/json", **({"Authorization": f"Bearer {token}"} if token else {})},
+        )
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return resp.status, json.loads(resp.read() or b"{}")
@@ -74,15 +77,35 @@ def setup_course(client, dataset, host, student, state_path):
 
     course = dataset["course"]
     print("Creating the eval course…")
-    act = need(*client.call("POST", "/api/activities", host,
-                            {"title": course["title"], "description": course["description"]}), "create activity")["id"]
-    need(*client.call("PATCH", f"/api/activities/{act}", host,
-                      {"learning_objectives": course["learning_objectives"],
-                       "prerequisites": course["prerequisites"]}), "set objectives")
+    act = need(
+        *client.call("POST", "/api/activities", host, {"title": course["title"], "description": course["description"]}),
+        "create activity",
+    )["id"]
+    need(
+        *client.call(
+            "PATCH",
+            f"/api/activities/{act}",
+            host,
+            {"learning_objectives": course["learning_objectives"], "prerequisites": course["prerequisites"]},
+        ),
+        "set objectives",
+    )
     for i, session in enumerate(course["sessions"], start=1):
-        need(*client.call("POST", "/api/sessions", host, {
-            "activity_id": act, "title": session["title"], "description": session["description"],
-            "start_time": f"2026-01-{i:02d}T10:00", "end_time": f"2026-01-{i:02d}T11:00"}), "create session")
+        need(
+            *client.call(
+                "POST",
+                "/api/sessions",
+                host,
+                {
+                    "activity_id": act,
+                    "title": session["title"],
+                    "description": session["description"],
+                    "start_time": f"2026-01-{i:02d}T10:00",
+                    "end_time": f"2026-01-{i:02d}T11:00",
+                },
+            ),
+            "create session",
+        )
     need(*client.call("POST", "/api/join", student, {"activity_id": act}), "student join")
     state_path.write_text(json.dumps({"dataset_version": dataset["version"], "activity_id": act}, indent=1))
     return act
@@ -115,13 +138,21 @@ def ask(client, act, student, case):
     """Ask any history turns first (same conversation), then the scored question."""
     conversation = None
     for turn in case.get("history", []):
-        status, body = client.call("POST", f"/api/activities/{act}/tutor/chat", student,
-                                   {"message": turn, **({"conversation_id": conversation} if conversation else {})})
+        status, body = client.call(
+            "POST",
+            f"/api/activities/{act}/tutor/chat",
+            student,
+            {"message": turn, **({"conversation_id": conversation} if conversation else {})},
+        )
         if status == 200:
             conversation = body["data"]["conversation_id"]
     started = time.time()
-    status, body = client.call("POST", f"/api/activities/{act}/tutor/chat", student,
-                               {"message": case["question"], **({"conversation_id": conversation} if conversation else {})})
+    status, body = client.call(
+        "POST",
+        f"/api/activities/{act}/tutor/chat",
+        student,
+        {"message": case["question"], **({"conversation_id": conversation} if conversation else {})},
+    )
     elapsed = round(time.time() - started, 2)
     if status != 200:
         return {"answer": "", "citations": [], "outcome": f"error {status}: {body.get('error')}"}, elapsed
@@ -134,7 +165,9 @@ def print_report(summary, thresholds, latencies):
         print(f"\n=== policy: {policy}   overall {o['passed']}/{o['total']} ({o['rate']:.0%})")
         for kind, r in entry["by_kind"].items():
             print(f"  {kind:14} {r['passed']:>3}/{r['total']:<3} {r['rate']:.0%}")
-        checks = ", ".join(f"{k} {v['passed']}/{v['total']}" for k, v in entry["answerable_checks"].items() if v["total"])
+        checks = ", ".join(
+            f"{k} {v['passed']}/{v['total']}" for k, v in entry["answerable_checks"].items() if v["total"]
+        )
         print(f"  answerable checks: {checks}")
         for f in entry["failures"]:
             print(f"    ✗ {f['case']}: {'; '.join(f['why'])}")
@@ -142,14 +175,21 @@ def print_report(summary, thresholds, latencies):
         print(f"\nlatency: median {statistics.median(latencies):.1f}s, max {max(latencies):.1f}s")
     if thresholds:
         t = thresholds
-        print(f"\nretrieval floor (MIN_RELEVANCE): answerable top scores {t['answerable']['min']}–{t['answerable']['max']}"
-              f" (median {t['answerable']['median']}), out-of-scope {t['out_of_scope']['min']}–{t['out_of_scope']['max']}"
-              f" (median {t['out_of_scope']['median']})")
-        print(f"  current {t['current_floor']}: keeps {t['current']['answerable_kept']} answerable, "
-              f"blocks {t['current']['out_of_scope_blocked']} out-of-scope before the model")
-        print(f"  best    {t['best_floor']}: keeps {t['best']['answerable_kept']} answerable, "
-              f"blocks {t['best']['out_of_scope_blocked']} out-of-scope"
-              f"{' (cleanly separable)' if t['separable'] else ' (ranges overlap)'}")
+        print(
+            f"\nretrieval floor (MIN_RELEVANCE): answerable top scores "
+            f"{t['answerable']['min']}–{t['answerable']['max']}"
+            f" (median {t['answerable']['median']}), out-of-scope {t['out_of_scope']['min']}–{t['out_of_scope']['max']}"
+            f" (median {t['out_of_scope']['median']})"
+        )
+        print(
+            f"  current {t['current_floor']}: keeps {t['current']['answerable_kept']} answerable, "
+            f"blocks {t['current']['out_of_scope_blocked']} out-of-scope before the model"
+        )
+        print(
+            f"  best    {t['best_floor']}: keeps {t['best']['answerable_kept']} answerable, "
+            f"blocks {t['best']['out_of_scope_blocked']} out-of-scope"
+            f"{' (cleanly separable)' if t['separable'] else ' (ranges overlap)'}"
+        )
 
 
 def main(argv=None):
@@ -206,16 +246,34 @@ def main(argv=None):
             latencies.append(elapsed)
             score = scoring.score_case(case, response, policy["mode"])
             print(f"  {'✓' if score['pass'] else '✗'} {case['id']:24} {response.get('outcome')}")
-            results.append({"policy": name, "mode": policy["mode"], "case": case, "score": score,
-                            "response": response, "seconds": elapsed, "top_retrieval_score": scores.get(case["id"])})
+            results.append(
+                {
+                    "policy": name,
+                    "mode": policy["mode"],
+                    "case": case,
+                    "score": score,
+                    "response": response,
+                    "seconds": elapsed,
+                    "top_retrieval_score": scores.get(case["id"]),
+                }
+            )
 
     summary = scoring.summarize(results)
     print_report(summary, thresholds, latencies)
-    Path(args.out).write_text(json.dumps({
-        "base_url": args.base_url, "dataset_version": dataset["version"], "activity_id": act,
-        "ran_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "summary": summary, "retrieval_threshold": thresholds, "results": results,
-    }, indent=1))
+    Path(args.out).write_text(
+        json.dumps(
+            {
+                "base_url": args.base_url,
+                "dataset_version": dataset["version"],
+                "activity_id": act,
+                "ran_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "summary": summary,
+                "retrieval_threshold": thresholds,
+                "results": results,
+            },
+            indent=1,
+        )
+    )
     print(f"\nFull report: {args.out}")
 
 

@@ -122,8 +122,9 @@ def matched_refused_topic(message: str, topics: List[str]) -> Optional[str]:
 
 
 def refusal_message(topic: str) -> str:
-    return (f"Your teacher has asked the tutor not to help with \"{topic}\". "
-            "Please ask your teacher about this directly.")
+    return (
+        f'Your teacher has asked the tutor not to help with "{topic}". ' "Please ask your teacher about this directly."
+    )
 
 
 HINT_ONLY_RULE = """- HINT-ONLY MODE (set by the teacher): the student must work the answer out themselves.
@@ -151,9 +152,11 @@ def prompt_rules(policy: Dict[str, Any]) -> str:
         rules.append(HINT_ONLY_RULE.rstrip())
     if policy.get("refused_topics"):
         topics = "; ".join(policy["refused_topics"])
-        rules.append(f"- The teacher has asked you not to help with these topics: {topics}. "
-                     "If the question is about one of them, say you can't help with it and suggest "
-                     "asking the teacher.")
+        rules.append(
+            f"- The teacher has asked you not to help with these topics: {topics}. "
+            "If the question is about one of them, say you can't help with it and suggest "
+            "asking the teacher."
+        )
     if policy.get("instructions"):
         rules.append(f"- Teacher's instructions: {policy['instructions']}")
     return "\n".join(rules)
