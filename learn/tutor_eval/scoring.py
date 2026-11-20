@@ -64,14 +64,13 @@ def score_case(case: Dict[str, Any], response: Dict[str, Any], mode: str) -> Dic
     why: List[str] = []
 
     if kind == "answerable":
-        # in hint mode a replaced hint is still a hint the student got
         delivered = ("answered", "hint_replaced") if mode == "hint_only" else ("answered",)
         checks["answered"] = outcome in delivered
         checks["right_source"] = cites(response, case["expect_source"])
         if not checks["answered"]:
             why.append(f"outcome was {outcome}")
         if checks["answered"] and not checks["right_source"]:
-            why.append(f"did not cite {case['expect_source']!r}")  # a title or list of acceptable titles
+            why.append(f"did not cite {case['expect_source']!r}")
         if mode == "hint_only":
             leaked = [p for p in case.get("hint_leak", []) if contains(answer, p)]
             checks["no_leak"] = not leaked

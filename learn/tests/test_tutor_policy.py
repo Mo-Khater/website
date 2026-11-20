@@ -10,18 +10,13 @@ import pytest
 
 import tutor_chat
 import tutor_policy
-# Course fixture (indexed Biology 101, tutor enabled) shared with the chat tests.
 from tests.test_tutor_chat import _chat, _req, env, worker  # noqa: F401
 
-
-# ---------------------------------------------------------------------------
-# tutor_policy (pure)
-# ---------------------------------------------------------------------------
 
 class TestValidateUpdate:
     def test_defaults(self):
         assert tutor_policy.normalize(None) == tutor_policy.DEFAULT_POLICY
-        assert tutor_policy.DEFAULT_POLICY["enabled"] is False   # teachers opt in
+        assert tutor_policy.DEFAULT_POLICY["enabled"] is False
 
     def test_partial_update_keeps_other_fields(self):
         current = tutor_policy.normalize({"mode": "hint_only", "daily_limit": 10})
@@ -54,11 +49,11 @@ class TestValidateUpdate:
 
 class TestRefusedTopics:
     @pytest.mark.parametrize("message, topics, expected", [
-        ("What are derivatives in calculus?", ["derivative"], "derivative"),          # prefix match
+        ("What are derivatives in calculus?", ["derivative"], "derivative"),
         ("Give me the final exam answers", ["final exam"], "final exam"),
-        ("When is the final project due?", ["final exam"], None),                      # all words needed
-        ("Is AI going to replace teachers?", ["AI"], "AI"),                            # short-only topic
-        ("Explain the main idea", ["AI"], None),                                       # not a substring hit
+        ("When is the final project due?", ["final exam"], None),
+        ("Is AI going to replace teachers?", ["AI"], "AI"),
+        ("Explain the main idea", ["AI"], None),
         ("How do plants make glucose?", ["exam", "essay"], None),
         ("Help with my ESSAY please", ["exam", "essay"], "essay"),
     ])
@@ -74,8 +69,8 @@ class TestPromptRules:
         rules = tutor_policy.prompt_rules(tutor_policy.normalize({
             "mode": "hint_only", "refused_topics": ["final exam"], "instructions": "Use simple English."}))
         assert "HINT-ONLY MODE" in rules and "must never state the answer" in rules
-        assert "ANSWER:" in rules and "HINT:" in rules   # hidden answer the hint is checked against
-        assert "Wrong:" in rules and "Right:" in rules   # worked example (needed live, see commit)
+        assert "ANSWER:" in rules and "HINT:" in rules
+        assert "Wrong:" in rules and "Right:" in rules
         assert "final exam" in rules
         assert "Teacher's instructions: Use simple English." in rules
 
@@ -92,10 +87,6 @@ def test_guiding_questions_do_not_count_against_citations():
     assert tutor_chat.cited_fraction(answer) == 1.0
 
 
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
-
 async def _call(worker, env, method, path, uid=None, body=None):
     resp = await worker._dispatch(_req(worker, env, method, f"/api/activities/act1/tutor{path}", uid, body), env)
     return resp.status, json.loads(resp.body)
@@ -110,7 +101,7 @@ async def _set_policy(worker, env, **fields):
 class TestPolicyEndpoints:
     async def test_host_reads_and_updates(self, worker, env):
         status, body = await _call(worker, env, "GET", "/policy", "host1")
-        assert status == 200 and body["data"]["policy"]["enabled"] is True   # fixture enabled it
+        assert status == 200 and body["data"]["policy"]["enabled"] is True
         assert body["data"]["limits"]["modes"] == ["answer", "hint_only"]
         policy = await _set_policy(worker, env, mode="hint_only", refused_topics=["final exam"])
         assert policy == {"enabled": True, "mode": "hint_only", "refused_topics": ["final exam"],
@@ -140,7 +131,6 @@ class TestEnforcement:
             assert (await _chat(worker, env, "student1", "How do plants capture sunlight?"))[0] == 200
         status, body = await _chat(worker, env, "student1", "How do plants capture sunlight?")
         assert status == 429 and "limit of 2" in body["error"]
-        # per student, and the host is never limited
         assert (await _chat(worker, env, "student2", "How do plants capture sunlight?"))[0] == 200
         for _ in range(3):
             assert (await _chat(worker, env, "host1", "How do plants capture sunlight?"))[0] == 200
@@ -166,7 +156,7 @@ class TestEnforcement:
         status, body = await _chat(worker, env, "student1", "How do plants capture sunlight?")
         system = env.AI.chat_calls[-1][1]["messages"][0]["content"]
         assert "HINT-ONLY MODE" in system and "Use simple English." in system
-        assert body["data"]["outcome"] == "answered"   # hint + guiding question passes grounding
+        assert body["data"]["outcome"] == "answered"
         assert body["data"]["answer"] == "Think about what captures light in a leaf [1]. What could it be?"
         assert len(env.AI.chat_calls) == 1
 
@@ -216,7 +206,6 @@ class TestReviewLog:
         assert answered["student"] == {"id": "student1", "name": "student1"}
         assert answered["citations"][0]["source_id"] == "s1"
         assert answered["withheld_text"] is None
-        # the teacher sees what the model tried to say, the student did not
         assert withheld["answer"] == tutor_chat.NOT_FOUND_ANSWER
         assert "French Revolution" in withheld["withheld_text"]
         assert body["data"]["stats"] == {"answered": 1, "not_found": 1, "withheld": 1, "refused_topic": 1,

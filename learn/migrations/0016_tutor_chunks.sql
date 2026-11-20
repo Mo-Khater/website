@@ -1,8 +1,3 @@
--- Migration 0016: AI tutor retrieval index
--- Chunk text for course-grounded tutor answers. Vectors live in Vectorize
--- (one namespace per activity); this table keeps the encrypted text and a
--- content hash so unchanged chunks are not re-embedded.
-
 CREATE TABLE IF NOT EXISTS tutor_chunks (
     id             TEXT PRIMARY KEY,
     activity_id    TEXT NOT NULL,

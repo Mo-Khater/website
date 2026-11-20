@@ -19,9 +19,9 @@ This document describes the retrieval-augmented generation (RAG) pipeline as the
 
 | Model | Used for |
 |---|---|
-| `@cf/baai/bge-base-en-v1.5` | embeddings (768-d), for chunks and queries |
+| `@cf/baai/bge-base-en-v1.5` | embeddings (768-d), for chunks, queries and (when chunking) sentences |
 | `@cf/baai/bge-reranker-base` | reranking the vector candidates |
-| `@cf/meta/llama-3.1-8b-instruct-fp8-fast` | query rewrites |
+| `@cf/meta/llama-3.1-8b-instruct-fp8-fast` | query rewrites and keywords |
 | `@cf/meta/llama-3.3-70b-instruct-fp8-fast` | answers and hints |
 | `toMarkdown` | converting PDF, Word, spreadsheets and HTML to Markdown |
 
@@ -37,12 +37,13 @@ This document describes the retrieval-augmented generation (RAG) pipeline as the
    .md / .txt → read directly ────────────────────────┘        │
                                        clean: link/image URLs dropped
                                        join: sections < 300 chars join a neighbour (never slides)
-                                       split: ≤ 1,200 chars, 200 overlap
+                                       split: a section that fits is one chunk; a longer one is split
+                                              by meaning (semantic chunking), ≤ 1,200 chars, no overlap
                                        dedupe: repeated chunk text indexed once
                                                                │
                                        only chunks whose content hash changed
                                                                │
-                         bge-base-en-v1.5 (768-d) ◄────────────┘
+                         bge-base-en-v1.5 (768-d) ◄────────────┘   (also each long section's sentences, to split it)
                               │                    │
                  Vectorize (namespace = course)   D1 tutor_chunks (encrypted text, locator, hash)
 
@@ -50,14 +51,16 @@ This document describes the retrieval-augmented generation (RAG) pipeline as the
  question ─► refused topic? ──yes──► refusal (no retrieval, no model)
               │ no
               ▼
- Llama 3.1 8B: up to 3 rewrites (sees only this question and the previous one)
+ Llama 3.1 8B: is it a follow-up of the previous question? + 3 rewrites (sees only those two questions)
               │
               ▼
- embed [question, previous question + question, rewrites…] with BGE's query instruction
-              │  Vectorize: top 20 per question query, top 5 per rewrite
+ embed [question, rewrites…] with BGE's query instruction
+              │  Vectorize: top 20 for the question, top 5 per rewrite
               │  each chunk keeps its best cosine; drop < 0.5
               ▼
- bge-reranker-base: order the candidates against the question ─► top 5
+ bge-reranker-base: order the candidates against the question made to stand alone (rewrite 1)
+              │
+ keyword boost: + 0.25 × share of the question's keywords in the passage (8B picks them) ─► top 5
               ▼
  nothing left? ──yes──► "not found" (no model call)
               │
@@ -99,9 +102,9 @@ Files are read from R2 (`MY_BUCKET`).
 | `.ppt .doc .odp` | refused, with a "save as .pptx / .docx / PDF" hint | |
 | images, anything else | refused: "unsupported file type" | |
 
-**Limits:** 10 MB per file, and 200,000 extracted characters per file (`_cap_sections` truncates the rest).
+**Limits:** no file-size limit; at most 200,000 extracted characters per file (`_cap_sections` truncates the rest). The whole file is still read into the Worker's memory (128 MB) and sent to `toMarkdown`, so a very large file can make the reindex fail; that shows up as "could not read file" or a failed reindex rather than a size message.
 
-**Skip reasons** the teacher can see: unsupported type, the "save as" hints, file not found in storage, file storage not configured, larger than 10 MB, could not convert (with the converter's message), could not read the presentation, no extractable text, or "could not read file" for any other error.
+**Skip reasons** the teacher can see: unsupported type, the "save as" hints, file not found in storage, file storage not configured, could not convert (with the converter's message), could not read the presentation, no extractable text, or "could not read file" for any other error.
 
 **Details**
 - **PDF pages:** `toMarkdown` marks pages with `Page N` headings. `split_markdown_sections` turns these into `page N`, and headings nested under a page keep the page number: `page 3, section: Mitosis`.
@@ -126,9 +129,15 @@ For each source, in order:
    - **The locator names the first and last joined section:** `section: Diffusion – section: Osmosis`, or `description – prerequisites`.
    - **Slides are never joined.** Most slides are short, so nearly every one would merge, and `slide 7` is the citation a student can look up.
    - Sections are only joined within one source, never across sources.
-3. **Split** (`chunk_text`) each section into chunks of at most **1,200 characters**.
-   - Splits prefer paragraph boundaries (blank lines), then sentence boundaries, then a hard cut.
-   - **Overlap:** consecutive chunks share up to **200 characters** of whole trailing paragraphs or sentences, so an answer that straddles a boundary is still retrievable.
+3. **Split** each section into chunks of at most **1,200 characters**. A section that fits is one chunk.
+   - **Longer sections are split by meaning** (`semantic_pieces`, `pack_sentences`; `SEMANTIC_CHUNKING = True`):
+     - the section is cut into sentences (`sentences_of`: paragraph by paragraph; a sentence over 1,200 characters is hard-cut);
+     - each sentence is embedded **together with the sentences either side of it**, so one short sentence doesn't look like a change of topic (the method of LangChain's SemanticChunker);
+     - the distance between neighbouring sentences is 1 − cosine of their embeddings;
+     - chunks are filled up to 1,200 characters, and each ends at the **biggest change of topic** once it has 400 characters (`SEMANTIC_MIN_CHARS`); with no change of topic in range, at the last sentence that fits;
+     - chunks **don't overlap**: they end where the topic changes, so less is lost at the edges than with fixed-size cuts. Because each sentence is embedded with its neighbours, a cut can land one sentence before or after the change.
+   - **Cost:** one embedding per sentence of every long section, **on every reindex**, even when nothing changed (chunks whose text is unchanged are still not re-embedded). At most 5,000 sentences per course (`MAX_SEMANTIC_SENTENCES`); sections past that are split the plain way.
+   - **Fallback, plain splitting** (`chunk_text`): if the sentence embedding fails, or `SEMANTIC_CHUNKING = False`, splits prefer paragraph boundaries (blank lines), then sentences, then a hard cut, and consecutive chunks share up to **200 characters** of whole trailing paragraphs or sentences. A warning is logged (`tutor_rag.semantic_pieces`); the index is still built.
    - Whitespace inside a paragraph is collapsed to single spaces, so line breaks within a paragraph (code, pseudocode, poems) are lost.
 4. **Drop duplicates:** a chunk whose text (lower-cased, whitespace-normalised) already appeared anywhere in the course is skipped. Repeated footers, menus and slide templates are indexed once. In the same CRAG pages, 19% of chunks were exact repeats.
 5. **Cap:** at most **2,000 chunks per course** (`MAX_CHUNKS_PER_ACTIVITY`), so one course can't run up the AI bill. Chunking stops at the cap; sources after that point are not indexed.
@@ -167,7 +176,7 @@ The response is `{chunks, embedded, unchanged, removed, skipped_files}`, with th
 
 ```python
 retrieve(env, activity_id, query: str | list[str], decrypt, top_k=5, min_score=0.0,
-         rerank_query=None, extra_queries=None)
+         rerank_query=None, extra_queries=None, keywords=None, keyword_weight=0.0)
 ```
 
 1. **Prepare the queries:** strip, cut each to 1,000 characters and de-duplicate. `extra_queries` that repeat a `query` are dropped. `top_k` is clamped to 1–20.
@@ -180,39 +189,54 @@ retrieve(env, activity_id, query: str | list[str], decrypt, top_k=5, min_score=0
 6. **Rerank** (with `rerank_query` and at least 2 candidates): `@cf/baai/bge-reranker-base` scores each candidate against `rerank_query`. Each candidate is sent as its embedding input (title, locator, text), cut to 1,600 characters, and the query is cut to 1,000. Candidates are sorted by that score (0–1).
    - **Why:** vector search compares two separately made embeddings. A cross-encoder reads the question and the passage together, so it can tell "about the same topic" from "answers the question".
    - **If the reranker fails** (an error, or scores missing for some passages), a warning is logged (`tutor_rag.rerank`) and the vector order is kept. The tutor keeps working.
-7. **Return** the best `top_k`, best first.
+7. **Keyword boost** (`keyword_boost`, with `rerank_query`, `keywords` and a `keyword_weight`): each candidate's score (the reranker's, or the cosine if the reranker failed) gets `keyword_weight × coverage`, where coverage is the share of the keywords found in the candidate's **text** (not its title, which every chunk of a page shares). Each keyword counts by how rare it is among the candidates (idf: `log((n+1)/(1+candidates containing it))`), so a keyword every candidate contains adds nothing. Matching ignores case, allows a plural `s`/`es`, and treats spaces, hyphens and apostrophes between words alike. Each candidate gains `keyword_coverage`.
+   - **Why:** the reranker judges overall relevance and can prefer a general passage over the one that names the exact team, company or term asked about ("Rayo Vallecano", "worst performer").
+8. **Return** the best `top_k`, best first.
 
-Each hit is `{chunk_id, source_type, source_id, source_title, locator, chunk_index, text, score}`, where `score` is the cosine, plus `rerank_score` when reranked. That's everything needed to cite it.
+Each hit is `{chunk_id, source_type, source_id, source_title, locator, chunk_index, text, score}`, where `score` is the cosine, plus `rerank_score` when reranked and `keyword_coverage` when boosted. That's everything needed to cite it.
 
-**No keyword index.** Keyword (hybrid) search was prototyped and measured, then removed until its security trade-offs are settled; see [section 12](#12-proposed-hybrid-search-not-implemented). The reranker stores nothing: it only reads candidates that vector search already found.
+**No keyword index.** Keyword (hybrid) search was prototyped and measured, then removed until its security trade-offs are settled; see [section 12](#12-proposed-hybrid-search-not-implemented). The reranker and the keyword boost store nothing: they only read candidates that vector search already found, decrypted at query time.
 
 ### What the chat searches with: `tutor_chat.find_passages`
 
 ```python
-rewrites = await expand_question(env, question, history)
-retrieve(env, activity_id, retrieval_queries(question, history), decrypt,
-         top_k=RETRIEVAL_K, min_score=MIN_RELEVANCE, extra_queries=rewrites,
-         rerank_query=rerank_query(question, history, rewrites))
+expansion = await expand_question(env, question, history)
+keywords = await extract_keywords(env, question)
+retrieve(env, activity_id, [question], decrypt,
+         top_k=RETRIEVAL_K, min_score=MIN_RELEVANCE, extra_queries=expansion.rewrites,
+         rerank_query=rerank_query(question, history, expansion),
+         keywords=keywords, keyword_weight=KEYWORD_WEIGHT)
 ```
 
-**Several queries** (`retrieval_queries`): **the question alone**, and, when there is a previous question, **the previous question plus this one**.
-- A follow-up like "when was that?" only finds anything with the previous question as context.
-- A topic change ("and Mercury's year?" after "what makes Mars red?") is drowned out if the previous question is always included.
-- Searching both and keeping each passage's best score handles both cases.
+**Query expansion** (`expand_question`): Llama 3.1 8B (`EXPANSION_MODEL`, temperature 0, at most 200 tokens) gets the question and, in a conversation, the student's **previous question**. It first decides whether the new question **continues** the previous one: it refers back to it ("it", "its", "that", "and what about…", "can you give an example") or only makes sense with it. A question that makes sense on its own is a new topic, even on a similar subject. It replies:
 
-**Query expansion** (`expand_question`): Llama 3.1 8B (`EXPANSION_MODEL`, temperature 0, at most 160 tokens) is asked for exactly three lines:
-1. the question rewritten to stand alone (replacing "it", "that"… using the earlier question);
-2. the same question in the terms a textbook would use;
-3. one sentence that a passage answering the question would contain.
+```
+RELATED: yes | no
+1. yes: the question rewritten to stand alone, naming what it refers to; no: the question as written
+2. the same question in the terms a textbook would use
+3. one sentence that a passage answering the question would contain
+```
 
-`parse_rewrites` removes numbering, bullets, quotes and the model's habit of introducing line 3 ("A passage answering this question might contain: …"). It drops copies of the question and lines under 3 characters, cuts each line to 300 characters and keeps at most 3.
+The prompt includes one worked example (quicksort, "Is it stable?").
 
-- **Privacy:** only the student's own questions go to this model (this one, and the previous one cut to 500 characters). It never sees course text or the tutor's replies. Its output is only embedded, and nobody sees it.
+`parse_expansion` reads the decision and the three lines. It removes numbering, bullets, Markdown, quotes and the model's habit of introducing line 3 ("A passage answering this question might contain: …"), cuts each line to 300 characters and keeps at most 3. It returns `Expansion(related, standalone, rewrites)`:
+- **`standalone`**, the question the reranker judges against: line 1 when the question continues the previous one (or the model didn't say). When it is a new topic, or the first question of a conversation, it is **the student's question itself**, whatever the model wrote on line 1: told to copy it, the 8B still sometimes "improved" it ("How are Huffman codes built?" → "How are variable-length prefix codes constructed?") or wrote an answer.
+- **`rewrites`**, the extra searches: the three lines without copies of the question.
+
+**What is searched:** the question and the rewrites. The previous question is never searched as such: for a follow-up, its context reaches the search through line 1 ("What is its running time?" after "What is depth-first search?" → "What is the running time of depth-first search?"). Before, the question was also searched glued to the previous one, so every later question in a conversation carried the old topic into the search, new topic or not.
+
+**What the reranker judges against** (`rerank_query`): `standalone`. Without it (the 8B failed or gave nothing usable): the previous question plus this one in a conversation, otherwise the question.
+
+- **Privacy:** only the student's own questions go to this model (this one, and the previous one cut to 500 characters). It never sees course text or the tutor's replies. Its output is only embedded and used for ranking, and nobody sees it.
 - **Rewrites only add candidates** (`extra_queries`, top 5 each). When they shared one candidate list with the question, the answer-like third line scored higher than the question did and pushed the question's own passages out of the reranker's 20 (CRAG: 44 against 47 of 58).
-- A rewrite may contain made-up facts, but it can only change which passages are found; the reranker then judges them against the real question.
+- A rewrite may contain made-up facts, but it can only change which passages are found; the reranker then judges them against the question.
 - **Best effort:** any failure logs a warning (`tutor_chat.expand_question`) and returns no rewrites; the question is searched as it is. `QUERY_EXPANSION = False` turns expansion off.
+- **Measured** (local models): on the eval set unchanged, the right lesson first for 22 of 23 and 5 of 8 off-topic questions without a passage; its follow-up "And how much ATP does that process make?" is marked related and reranked as "How much ATP is produced in glycolysis?". On the 47 CRAG questions (single questions, plain chunking, no keyword boost) also unchanged: 36 of 47, the same questions as with the old prompt.
 
-**What the reranker judges against** (`rerank_query`): the question itself. For a follow-up, the stand-alone rewrite (the first line), or, if there are no rewrites, the previous question plus this one.
+**Keywords** (`extract_keywords`): the same Llama 3.1 8B, in a second short call (temperature 0, at most 60 tokens), lists up to 5 keywords: the names, specific terms, numbers and dates a passage answering the question must mention. `parse_keywords` keeps a keyword only when **every word of it is in the question** (after light stemming, so "divorced" allows "divorce") and it isn't only general words (what, the, best, today…).
+- **Why the filter:** asked for keywords, the model often adds the answer it believes: "Nucleus" for "Which organelle contains the cell's DNA?", "Canberra" for the capital of Australia, and wrong ones too. Boosting those would push the passages towards the model's guess. The filter removed every such guess in the experiment below, the correct ones included.
+- **Privacy:** like the rewrites, the call sees only the student's question.
+- **Best effort:** any failure logs a warning (`tutor_chat.extract_keywords`) and returns no keywords; the reranker's order is used. `KEYWORD_BOOST = False` turns it off.
 
 ### Measured on 200 CRAG questions and the eval set
 
@@ -233,6 +257,22 @@ Retrieval only, run locally at no cost. The embedding model and reranker are the
 - **Query expansion** is about neutral on CRAG's self-contained web questions. It's the only change that fixed the eval set's "What is crossing over?", where the student's words don't match the lesson's, and it gives the reranker a stand-alone question for follow-ups.
 - **The new chunking** is a large gain for vector search alone (+10), within noise once the reranker is on (2 gained, 3 lost), and halves indexing cost.
 - **End to end** with Llama 3.3 70B, answer mode on the eval set went from 36/38 to **37/38**: all 23 answerable, 8 out-of-scope and 4 injection cases passed. The one miss is the refused-topic paraphrase. Hint-only mode passed 14 of 14 before the run's neuron budget ran out.
+- **Semantic chunking, keyword boost and query decomposition** were measured later (2026-11-19) on the 47 CRAG questions of this sample whose short answer is in the pages and **not already in the question** (the earlier check counted "the chainsmokers" as found because the question names them):
+
+  | Retrieval (today's search: question + rewrites + reranker) | Answer in the 5 passages (of 47) |
+  |---|---|
+  | plain chunking (before) | 36 |
+  | semantic chunking, cut at the source's 95th-percentile change | 38 |
+  | **semantic packing (adopted)** | **39** (+3, none lost) |
+  | plain chunking + keyword boost, weight 0.1 | 36 (1 gained, 1 lost) |
+  | plain chunking + **keyword boost, weight 0.25 (adopted)** | **37** (2 gained, 1 lost) |
+  | plain chunking + keyword boost, weight 0.5 | 37 |
+  | plain chunking + query decomposition (sub-questions as extra searches) | 36 |
+
+  - The eval set was the same for every variant: right lesson in the 5 for 22 of 23, out-of-scope blocked 5 of 8.
+  - **End to end**, the production 70B answered the questions whose retrieval changed with semantic chunking: no answer changed. On two of them (the worst Dow Jones performer, the elevation of Hawaii's capital) the answer reached the passages and the model still said it wasn't there; the third (Randall Wallace's birth date) was already answered, written "July 28, 1949" against the check's "1949-07-28".
+  - The keyword boost changes the 5 passages on 31 of 47 questions for one more answer found. Both gains are within noise for 47 questions; they were adopted for their mechanism, and should be re-measured on a larger sample.
+  - **Not adopted, query decomposition:** Llama 3.1 8B split 39 of 47 questions, mostly needlessly, and often guessed answers ("What is Taal Volcano?" for the most active volcano, which is Mayon). The rewrites already search both parts of a comparison, and passages found by a sub-question are still reranked against the whole question. A multi-hop question ("…Best Picture **that year**?") needs a second search after the first answer, not a split.
 - **Not adopted, a reranker score floor.** On the eval set, the off-topic questions' best passages scored ≤ 0.006 and the answerable ones ≥ 0.517. A floor of 0.01 would have stopped every off-topic question before the model, but "What should I know before starting this course?" scores 0.0088 against the prerequisites. The model handles off-topic questions with `NOT_IN_COURSE` anyway.
 
 ## 5. Answering: `tutor_chat.answer`
@@ -245,7 +285,11 @@ Retrieval only, run locally at no cost. The embedding model and reranker are the
 | `RETRIEVAL_K` | 5 | passages given to the model |
 | `MIN_RELEVANCE` | 0.5 | cosine floor; a passage below it for every query is ignored |
 | `QUERY_EXPANSION` | `True` | rewrite the question for search |
-| `EXPANSION_MODEL` | `@cf/meta/llama-3.1-8b-instruct-fp8-fast` | writes the rewrites |
+| `EXPANSION_MODEL` | `@cf/meta/llama-3.1-8b-instruct-fp8-fast` | writes the rewrites and picks the keywords |
+| `KEYWORD_BOOST` | `True` | pick keywords and boost passages that contain them |
+| `KEYWORD_WEIGHT` | `0.25` | added to a 0–1 reranker score at full keyword coverage |
+| `MAX_KEYWORDS` | `5` | |
+| `tutor_rag.SEMANTIC_CHUNKING` | `True` | split long sections by meaning when indexing |
 | `MAX_REWRITES` | 3 | |
 | `tutor_rag.RERANK_MODEL` | `@cf/baai/bge-reranker-base` | |
 | `tutor_rag.RERANK_CANDIDATES` | 20 | vector candidates per question query |
@@ -346,12 +390,15 @@ HINT: Source [1] explains what the light reactions split. If water is split, whi
 | `daily_limit` | 30 | **code**: questions per student per UTC day, counted from stored messages; 429 when reached. 0 = no limit; at most 500. Hosts are exempt. |
 | `instructions` | "" | **prompt**: added as "Teacher's instructions: …". At most 1,000 characters. |
 
+- **Wording refused topics:** each topic word must *start* a word of the question, so use the shortest form: `homework answer` catches "answer my homework", but `homework answers` doesn't, because "answer" doesn't start with "answers". Words may be in any order and apart ("Is test and set atomic?" matches `test-and-set`).
+- **Instructions change style, not the checks.** They're added after the grounding rules, and the checks in section 5 run in code after the model replies. So "answer from your own knowledge too" can't get uncited text past the citation check. But an instruction that makes the model write uncited sentences (for example "explain with an everyday analogy") can get answers **withheld**. An instruction to answer in another language works, but the hedge check only knows English phrasings.
+
 ## 7. Conversations and privacy
 
 - **History comes from the server, never the client.** `api_tutor_chat` loads the last 6 messages of `conversation_id` from `tutor_messages`, for this course and this user only. A caller can't plant fake assistant turns. An unknown conversation id, or another user's, returns 404.
 - **Storage:** every question and answer is stored **encrypted** (`content_encrypted`), with the citations (without passage text), `grounded`, `outcome`, and any model text the student didn't see (`withheld_encrypted`). If storing fails, the error is reported and the student still gets the answer.
 - **Students are told:** the status endpoint returns the notice "Your teacher can read your questions and the tutor's answers.", and the chat card shows it.
-- **Which models see what:** course files go to `toMarkdown`; course text goes to the embedding model, the reranker and the 70B model; the rewrite model sees only the student's questions. All are Workers AI, on the same Cloudflare account. Vectorize holds only vectors.
+- **Which models see what:** course files go to `toMarkdown`; course text goes to the embedding model, the reranker and the 70B model; the rewrite and keyword calls see only the student's questions. All are Workers AI, on the same Cloudflare account. Vectorize holds only vectors.
 
 ## 8. Endpoints
 
@@ -382,21 +429,22 @@ Then uncomment the `[[vectorize]]` block in `wrangler.toml` (deploys fail while 
 | Call | Neurons |
 |---|---|
 | Llama 3.3 70B answer: ~2,000 tokens in, up to 350 out | ~60–100 |
-| Llama 3.1 8B rewrites: ~150 tokens in, up to 160 out | ~3–6 |
+| Llama 3.1 8B rewrites: ~200 tokens in, up to 200 out | ~3–7 |
+| Llama 3.1 8B keywords: ~150 tokens in, up to 60 out | ~1–3 |
 | Reranker, 20–55 passages of ≤ 1,600 characters | ~2–6 |
 | Query embeddings | < 1 |
 
 - **Hint-only mode:** a hint that fails the check costs a second 70B call.
 - **Refused and over-limit questions** skip everything. Questions with no passage above the floor skip the 70B call.
-- **Reindexing** costs about 6 neurons per 1,000 tokens embedded, and only changed chunks are embedded. A 170-page textbook (412 chunks) comes to roughly 650 (estimated from its token count).
+- **Reindexing** costs about 6 neurons per 1,000 tokens embedded. Only changed chunks are embedded, but semantic chunking embeds every sentence of every long section, each with its neighbours (about 3 times the text), **on every reindex**. A 170-page textbook (412 chunks): roughly 650 for its chunks the first time, plus roughly 1,900 for its sentences each time (both estimated from its token count). With `SEMANTIC_CHUNKING = False` an unchanged course reindexes for free.
 
-**After upgrading to this chunking,** chunk texts and locators change, so the first reindex of each course re-embeds it once.
+**After upgrading the chunking** (to the cleaned and merged sections, and again to semantic chunking), chunk texts change, so the first reindex of each course re-embeds it once.
 
 ## 10. Testing and evaluation
 
 | What | Where |
 |---|---|
-| **Unit tests**, against in-memory D1, R2, Vectorize and Workers AI fakes (`tests/tutor_fakes.py`: bag-of-words embedder and reranker, scriptable chat and rewrite models). They cover: chunking (link cleaning, joining short sections, slides, duplicates), section splitting, `.pptx` parsing, incremental indexing, multi-query retrieval, the query instruction, rewrites and their failure, reranking and its fallback, prompt building, citation and hedge checks, hint leak checks, outcomes, policy validation and endpoints. | `tests/test_tutor_rag.py`, `test_tutor_chat.py`, `test_tutor_hints.py`, `test_tutor_policy.py` |
+| **Unit tests**, against in-memory D1, R2, Vectorize and Workers AI fakes (`tests/tutor_fakes.py`: bag-of-words embedder and reranker, scriptable chat, rewrite and keyword models). They cover: chunking (link cleaning, joining short sections, slides, duplicates, semantic splitting and its fallback), section splitting, `.pptx` parsing, incremental indexing, multi-query retrieval, the query instruction, rewrites and their failure, reranking and its fallback, keyword filtering and the boost, prompt building, citation and hedge checks, hint leak checks, outcomes, policy validation and endpoints. | `tests/test_tutor_rag.py`, `test_tutor_chat.py`, `test_tutor_hints.py`, `test_tutor_policy.py` |
 | **Evaluation set:** 38 cases on a small original course, under each policy: answerable, out-of-scope, prompt injection and refused topics. | `tutor_eval/` (`README.md`), `tests/test_tutor_eval.py` |
 | **CRAG** (Meta's RAG benchmark): real web pages and questions, through the real pipeline with the production models; conversion, embeddings and reranking run locally. | `tutor_eval/run_crag.py` (`CRAG.md`), `tests/test_tutor_crag.py` |
 
@@ -411,7 +459,9 @@ Then uncomment the `[[vectorize]]` block in `wrangler.toml` (deploys fail while 
 - **Positional chunk ids:** an edit near the start of a long file re-embeds the rest of that file.
 - **Link addresses aren't indexed.** The tutor can name a linked page but not give its URL, unless the URL is written out as the link's text.
 - **Boilerplate that isn't repeated word for word** (a menu that differs by one item) is still indexed. Without its URLs such a chunk is short and rarely wins.
-- **Retrieval adds latency:** the rewrite call and the reranker call each add a round trip before the answer starts.
+- **Retrieval adds latency:** the rewrite call, the keyword call and the reranker call each add a round trip before the answer starts.
+- **Semantic chunking is paid on every reindex,** even when nothing changed, and a large course makes about one embedding call per 50 sentences (about 90 for a 170-page textbook) inside the reindex request.
+- **The keyword filter drops correct terms the student didn't use.** A keyword must be in the question, so "Mayon" can't be boosted for "the most active volcano in the Philippines", by design.
 - **`MIN_RELEVANCE` (0.5)** is tuned on the evaluation set, not on a large corpus.
 - **Indexing runs in the request,** not in a background queue.
 
@@ -507,7 +557,7 @@ A blind index is not encryption. Someone who gets a copy of the D1 database, but
 | Option | Leaks | Finds chunks that vectors miss | Cost |
 |---|---|---|---|
 | **A. Encrypted postings:** keep the term hash as the lookup key, but AES-encrypt `df` and `postings`. Decrypt only the ≤ 16 rows a question touches. | Vocabulary size, and which term rows exist. **No** frequencies, co-occurrence or chunk ids. | yes | One decryption per query word. Writes are the same. |
-| **B. Rerank only:** no stored keyword index; reorder the vector candidates at query time. | **nothing new** | no: it can only reorder what vector search found | **Done** as the cross-encoder reranker (section 4): CRAG recall 41 → 47 of 58. |
+| **B. Rerank only:** no stored keyword index; reorder the vector candidates at query time. | **nothing new** | no: it can only reorder what vector search found | **Done** as the cross-encoder reranker (section 4): CRAG recall 41 → 47 of 58, and the keyword boost on top of it. |
 | **C. Option A with a separate secret** (e.g. `TUTOR_INDEX_KEY`) | as A | yes | One more secret to manage. |
 | D. FTS5 on plaintext | all chunk text, in the clear | yes | Rejected: breaks encryption at rest. |
 

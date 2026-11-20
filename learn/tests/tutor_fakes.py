@@ -3,7 +3,7 @@ Shared fakes for the AI tutor tests.
 
 D1 is faked with a real in-memory SQLite database (run the worker's own DDL
 on it), Workers AI with a deterministic bag-of-words embedder and reranker
-plus scriptable chat and query-rewrite models, Vectorize with an in-memory namespace-aware cosine
+plus scriptable chat, query-rewrite and keyword models, Vectorize with an in-memory namespace-aware cosine
 index, and R2 with a dict — so tests exercise real SQL and real ranking.
 """
 
@@ -13,17 +13,12 @@ import re
 import sqlite3
 from types import SimpleNamespace
 
-# ---------------------------------------------------------------------------
-# Fakes
-# ---------------------------------------------------------------------------
 
 class _Stmt:
     def __init__(self, conn, sql, args=()):
         self.conn, self.sql, self.args = conn, sql, args
 
     def bind(self, *args):
-        # Real D1 under Pyodide receives Python None as JS undefined and throws
-        # D1_TYPE_ERROR; fail the same way so tests catch it.
         if any(a is None for a in args):
             raise TypeError(f"D1_TYPE_ERROR: undefined bind value in {args!r}")
         return _Stmt(self.conn, self.sql, args)
@@ -56,7 +51,7 @@ class SqliteD1:
         return _Stmt(self.conn, sql)
 
     async def batch(self, stmts):
-        with self.conn:   # one transaction, like D1
+        with self.conn:
             for st in stmts:
                 self.conn.execute(st.sql, st.args)
 
@@ -66,7 +61,7 @@ _VOCAB = 256
 
 def _embed(text):
     import tutor_rag
-    if text.startswith(tutor_rag.QUERY_INSTRUCTION):   # the instruction carries no content
+    if text.startswith(tutor_rag.QUERY_INSTRUCTION):
         text = text[len(tutor_rag.QUERY_INSTRUCTION):]
     vec = [0.0] * _VOCAB
     for word in re.findall(r"[a-z]+", text.lower()):
@@ -81,23 +76,25 @@ class FakeAI:
         self.calls = []
         self.chat_calls = []
         self.expansion_calls = []
+        self.keyword_calls = []
         self.rerank_calls = []
-        # Replace in a test to script the chat model; receives the messages.
         self.chat_responder = lambda messages: "From the course materials: see [1]."
-        # The query-rewrite model; by default it offers no rewrites.
         self.expansion_responder = lambda messages: ""
-        # Replace to script the reranker: (query, texts) -> scores.
+        self.keyword_responder = lambda messages: ""
         self.rerank_responder = None
 
     async def run(self, model, payload):
         import tutor_chat
+        if "messages" in payload and payload["messages"][0]["content"] == tutor_chat.KEYWORD_PROMPT:
+            self.keyword_calls.append((model, payload))
+            return {"response": self.keyword_responder(payload["messages"])}
         if "messages" in payload and model == tutor_chat.EXPANSION_MODEL:
             self.expansion_calls.append((model, payload))
             return {"response": self.expansion_responder(payload["messages"])}
-        if "messages" in payload:   # chat model
+        if "messages" in payload:
             self.chat_calls.append((model, payload))
             return {"response": self.chat_responder(payload["messages"])}
-        if "contexts" in payload:   # reranker: cosine of the bag-of-words vectors
+        if "contexts" in payload:
             texts = [c["text"] for c in payload["contexts"]]
             self.rerank_calls.append((model, payload["query"], texts))
             if self.rerank_responder:
@@ -118,8 +115,6 @@ class FakeAI:
             if raw.startswith("BROKEN"):
                 out.append({"name": d["name"], "format": "error", "error": "corrupt file"})
             else:
-                # Shape observed from the real service for a PDF: file-name heading,
-                # a Metadata list, an empty Contents heading, then one heading per page.
                 pages = raw.split("\f")
                 body = "\n".join(f"### Page {n}\n{text}" for n, text in enumerate(pages, start=1))
                 md = (f"# {d['name']}\n## Metadata\n- PDFFormatVersion=1.6\n- Producer=LibreOffice 7.3\n"
@@ -150,7 +145,7 @@ class FakeR2:
 
 class FakeVectorize:
     def __init__(self):
-        self.vectors = {}   # (namespace, id) -> values
+        self.vectors = {}
 
     async def upsert(self, records):
         for r in records:

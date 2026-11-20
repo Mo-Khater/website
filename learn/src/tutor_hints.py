@@ -34,7 +34,6 @@ COPY_RUN_WORDS = 6
 _CITATION_RE = re.compile(r"\[\d{1,2}(?:\s*,\s*\d{1,2})*\]")
 _TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|\n+")
-# A line starting with ANSWER: or HINT:, allowing markdown such as "**ANSWER:**".
 _FIELD_RE = re.compile(r"^[\s*_#>-]*(ANSWER|HINT)[\s*_]*:[\s*_]*", re.IGNORECASE | re.MULTILINE)
 
 STOPWORDS = frozenset("""

@@ -1,8 +1,3 @@
--- Migration 0017: AI tutor conversations
--- Every tutor exchange is stored server-side (content AES-encrypted), so
--- conversation history cannot be forged by the client, and so teachers can
--- later review what their tutor said.
-
 CREATE TABLE IF NOT EXISTS tutor_messages (
     id                TEXT PRIMARY KEY,
     conversation_id   TEXT NOT NULL,

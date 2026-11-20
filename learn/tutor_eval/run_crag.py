@@ -52,7 +52,7 @@ LEARN = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(LEARN))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import tests.conftest  # noqa: E402,F401  (stubs for the Workers runtime: js, pyodide, workers)
+import tests.conftest  # noqa: E402,F401
 import crag_scoring  # noqa: E402
 import tutor_chat  # noqa: E402
 import tutor_rag  # noqa: E402
@@ -60,17 +60,14 @@ from tests.helpers import MockRequest, load_worker  # noqa: E402
 from tests.tutor_fakes import FakeR2, FakeVectorize, SqliteD1  # noqa: E402
 
 TEMPLATES_URL = "https://raw.githubusercontent.com/facebookresearch/CRAG/main/prompts/templates.py"
-EMBED_MODEL = "BAAI/bge-base-en-v1.5"   # what @cf/baai/bge-base-en-v1.5 serves
-RERANK_MODEL = "BAAI/bge-reranker-base"   # what @cf/baai/bge-reranker-base serves
+EMBED_MODEL = "BAAI/bge-base-en-v1.5"
+RERANK_MODEL = "BAAI/bge-reranker-base"
 
-# Workers AI price of the production chat model, in neurons per token
-# (Llama 3.3 70B fp8-fast: $0.293 / M input, $2.253 / M output; 1,000 neurons = $0.011).
 NEURONS_PER_INPUT_TOKEN = 26_668 / 1e6
 NEURONS_PER_OUTPUT_TOKEN = 204_805 / 1e6
-# (input, output) neurons per token of each chat model the tutor calls
 NEURON_PRICES = {
     tutor_chat.CHAT_MODEL: (NEURONS_PER_INPUT_TOKEN, NEURONS_PER_OUTPUT_TOKEN),
-    tutor_chat.EXPANSION_MODEL: (4_119 / 1e6, 34_868 / 1e6),   # Llama 3.1 8B fp8-fast
+    tutor_chat.EXPANSION_MODEL: (4_119 / 1e6, 34_868 / 1e6),
 }
 
 
@@ -78,8 +75,6 @@ class BudgetExceeded(Exception):
     pass
 HOST, STUDENT = "crag-host", "crag-student"
 
-
-# ---------------------------------------------------------------- local stand-ins
 
 def html_to_markdown(html: str) -> str:
     """Stand-in for toMarkdown: drop non-content elements, keep headings/links/lists."""
@@ -98,7 +93,7 @@ class LocalAI:
     def __init__(self, backend: str, url: str, chat_model: str, cache_path: Path,
                  budget_neurons: float = 0, num_ctx: int = 8192, expansion_model: str = "llama3.1:8b"):
         self.backend, self.url, self.chat_model, self.num_ctx = backend, url.rstrip("/"), chat_model, num_ctx
-        self.expansion_model = expansion_model   # Ollama stand-in for tutor_chat.EXPANSION_MODEL
+        self.expansion_model = expansion_model
         self._reranker = None
         self.budget = budget_neurons
         self.cache_path = cache_path
@@ -108,7 +103,6 @@ class LocalAI:
                       "chat_calls": 0, "chat_seconds": 0.0, "prompt_tokens": 0, "output_tokens": 0,
                       "neurons": 0.0}
 
-    # -- embeddings
     def _embed(self, texts):
         if self._embedder is None:
             from fastembed import TextEmbedding
@@ -128,24 +122,20 @@ class LocalAI:
     def save_cache(self):
         self.cache_path.write_text(json.dumps(self.cache))
 
-    # -- chat
     def neurons_left(self) -> float:
         return self.budget - self.stats["neurons"] if self.backend == "workers-ai" else float("inf")
 
-    # -- reranker
     def _rerank(self, query, texts):
         if self._reranker is None:
             from fastembed.rerank.cross_encoder import TextCrossEncoder
             self._reranker = TextCrossEncoder(RERANK_MODEL)
         self.stats["rerank_calls"] = self.stats.get("rerank_calls", 0) + 1
-        # Workers AI returns the sigmoid of the model's logit (checked: 2.318 -> 0.910)
         return [1 / (1 + math.exp(-float(x))) for x in self._reranker.rerank(query, texts)]
 
     def chat(self, messages, temperature=0.2, max_tokens=350, json_mode=False, model=None):
         model = model or tutor_chat.CHAT_MODEL
         if self.backend == "workers-ai":
             price_in, price_out = NEURON_PRICES[model]
-            # worst case for this call: ~4 characters per token in, max_tokens out
             prompt_chars = sum(len(m.get("content") or "") for m in messages)
             worst = prompt_chars / 4 * price_in + max_tokens * price_out
             if worst > self.neurons_left():
@@ -181,14 +171,12 @@ class LocalAI:
         self.stats["prompt_tokens"] += int(tokens_in)
         self.stats["output_tokens"] += int(tokens_out)
         if self.backend == "workers-ai":
-            # Workers AI reports the call's neurons; fall back to the published price
             self.stats["neurons"] += float((out.get("usage") or {}).get("neurons") or
                                            tokens_in * price_in + tokens_out * price_out)
-        if isinstance(text, (dict, list)):   # JSON-mode replies can arrive parsed
+        if isinstance(text, (dict, list)):
             text = json.dumps(text)
         return text or ""
 
-    # -- the Workers AI binding interface
     async def run(self, model, payload):
         if "messages" in payload:
             return {"response": self.chat(payload["messages"], payload.get("temperature", 0.2),
@@ -205,12 +193,10 @@ class LocalAI:
             raw = b"".join(bytes(p) for p in d["blob"].parts).decode("utf-8", "replace")
             try:
                 out.append({"name": d["name"], "format": "markdown", "data": html_to_markdown(raw)})
-            except Exception as exc:   # behave like the service: report, don't crash
+            except Exception as exc:
                 out.append({"name": d["name"], "format": "error", "error": str(exc)})
         return out
 
-
-# ---------------------------------------------------------------- plain page text (diagnostics)
 
 class _Text(HTMLParser):
     def __init__(self):
@@ -262,8 +248,6 @@ def load_judge_prompt(source: str):
     return values["INSTRUCTIONS"], values["IN_CONTEXT_EXAMPLES"], hashlib.sha256(code.encode()).hexdigest()[:12]
 
 
-# ---------------------------------------------------------------- the worker, in-process
-
 class Site:
     def __init__(self, ai: LocalAI):
         self.worker = load_worker()
@@ -305,10 +289,6 @@ class Site:
         return act
 
 
-# ---------------------------------------------------------------- run
-
-# A question costs about 100 neurons to answer and 100-250 to judge on Workers
-# AI; don't start one unless this much budget is left, so none ends half-scored.
 NEURONS_PER_QUESTION_RESERVE = 500
 
 
@@ -365,7 +345,6 @@ async def run(args):
             break
         act, golds = ex["_activity"], crag_scoring.gold_answers(ex)
         message = f"{ex['query']}\n(Current time: {ex['query_time']})"
-        # what retrieval found (the same search the chat does first), for diagnostics
         hits = await tutor_chat.find_passages(site.env, act, message, [],
                                               site.worker._maybe_decrypt_factory(site.env.ENCRYPTION_KEY))
         started = time.time()

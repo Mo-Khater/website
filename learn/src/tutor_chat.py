@@ -3,8 +3,10 @@ Course-grounded tutor answers (Workers AI chat model over tutor_rag hits).
 
 Flow for one student message:
   1. Search the activity's materials with the question and rewrites of it
-     from a small model (query expansion), then let a reranker pick the
-     passages that best answer the question (tutor_rag.retrieve).
+     from a small model (query expansion; the model also decides whether the
+     question continues the previous one), then let a reranker pick the
+     passages that best answer the question, nudged towards passages that
+     contain the question's keywords (tutor_rag.retrieve).
   2. If nothing relevant was found, answer "not in the course materials"
      without calling the model — it cannot make anything up that way.
   3. Otherwise give the model the numbered passages and ask it to answer
@@ -33,6 +35,7 @@ Every result has an ``outcome`` for the teacher's review log:
 
 import json
 import re
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import tutor_hints
@@ -41,31 +44,36 @@ import tutor_rag
 
 CHAT_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
 MAX_MESSAGE_CHARS = 2000
-HISTORY_MESSAGES = 6          # previous messages (user + assistant) sent to the model
+HISTORY_MESSAGES = 6
 RETRIEVAL_K = 5
-MIN_RELEVANCE = 0.5           # cosine score floor; tune with the evaluation set
-MIN_CITED_FRACTION = 0.5      # share of substantive sentences that must cite a source
-MAX_ANSWER_TOKENS = 350       # eval: longest real answer ~110 tokens; caps injection essays
+MIN_RELEVANCE = 0.5
+MIN_CITED_FRACTION = 0.5
+MAX_ANSWER_TOKENS = 350
 TEMPERATURE = 0.2
 
-# Query expansion: a small, cheap model rewrites the question for search.
-# Only the student's own questions go to it, never course text, and its
-# output is only ever embedded, never shown to anyone.
-QUERY_EXPANSION = True   # off: search with the question alone (saves ~4 neurons and ~0.5 s a question)
+QUERY_EXPANSION = True
 EXPANSION_MODEL = "@cf/meta/llama-3.1-8b-instruct-fp8-fast"
-EXPANSION_MAX_TOKENS = 160
+EXPANSION_MAX_TOKENS = 200
 MAX_REWRITES = 3
 EXPANSION_PROMPT = """You turn a student's question into search queries for their course materials.
-Write exactly 3 lines:
-1. The question rewritten so it makes sense on its own. If an earlier question is given, use it to replace words like "it", "that" or "they".
+You may also get the student's earlier question. First decide whether the new question continues it.
+It continues it when it refers back to it (it, its, that, they, those, this, "and what about", "can you give an example")
+or only makes sense together with it. A question that makes sense on its own does not continue it, even on a similar subject.
+
+Reply in exactly this form:
+RELATED: yes or no (no when there is no earlier question)
+1. If RELATED is yes: the question rewritten to make sense on its own, naming what it refers to. If RELATED is no: the question exactly as the student wrote it.
 2. The same question in different words, using the terms a textbook would use.
 3. One sentence that a passage answering the question would contain.
-Write only the 3 lines. Do not number them or add anything else."""
 
-# The model replies with this marker when the sources don't cover a question.
-# Without it, Llama's refusals listed what the sources *do* cover with
-# citations ("sources [1] to [5] cover..."), which passed the citation check
-# and was logged as an answer (found by the evaluation set).
+Example.
+Earlier question: How does quicksort work?
+Question: Is it stable?
+RELATED: yes
+1. Is quicksort stable?
+2. Does quicksort preserve the relative order of equal elements?
+3. Quicksort is not stable, because partitioning can reorder equal elements."""
+
 NOT_IN_COURSE = "NOT_IN_COURSE"
 
 NOT_FOUND_ANSWER = (
@@ -100,9 +108,6 @@ def format_sources(hits: List[Dict[str, Any]]) -> str:
     return "\n\n".join(blocks)
 
 
-# The teacher can change the mode mid-conversation. Without this note the
-# model copies the style of its earlier replies (e.g. keeps giving hints after
-# the teacher switched to full answers), because history outweighs the rules.
 HISTORY_RULE = ("- Earlier replies in this conversation may have followed different settings. "
                 "Follow the rules above now, not the style of earlier replies.")
 
@@ -121,55 +126,80 @@ def build_messages(course_title: str, hits: List[Dict[str, Any]],
     return [{"role": "system", "content": system}, *turns, {"role": "user", "content": question}]
 
 
-def retrieval_queries(question: str, history: List[Dict[str, str]]) -> List[str]:
-    """What to search for: the question alone, plus the question with the
-    previous one when there is a previous one.
-
-    A follow-up like "when was that?" only finds anything with the previous
-    question for context, but a new topic ("and Mercury's year?") after
-    "what makes Mars red?" gets drowned out by it. Searching both and keeping
-    each passage's best score handles both cases.
-    """
-    previous = [m["content"] for m in history if m.get("role") == "user"][-1:]
-    queries = [question[:tutor_rag.MAX_QUERY_CHARS]]
-    if previous:
-        queries.append("\n".join(previous + [question])[:tutor_rag.MAX_QUERY_CHARS])
-    return queries
-
-
 _LIST_PREFIX_RE = re.compile(r"^\s*(?:\d+[.)]|[-*•]|(?:query|line)\s*\d*\s*:)\s*", re.IGNORECASE)
-# the 8B model sometimes introduces line 3: 'A passage answering this question might contain: "..."'
 _PREAMBLE_RE = re.compile(r"^(?:an?\s+)?passages?\s+answering\s+(?:this|the)\s+question\s+"
                           r"(?:might|would|could|may)\s+contain(?:\s+the\s+sentence)?\s*:\s*", re.IGNORECASE)
 
 
-def parse_rewrites(reply: str, question: str) -> List[str]:
-    """The model's lines, without numbering or quotes, minus copies of the question."""
-    seen = {" ".join(question.lower().split())}
-    out = []
-    for line in (reply or "").splitlines():
-        line = _PREAMBLE_RE.sub("", _LIST_PREFIX_RE.sub("", line).strip()).strip().strip('"\'').strip()
-        key = " ".join(line.lower().split())
-        if len(key) < 3 or key in seen:
+_RELATED_RE = re.compile(r"^[\s*_#>-]*related[\s*_]*:[\s*_]*(yes|no)\b", re.IGNORECASE)
+
+
+@dataclass
+class Expansion:
+    """What the small model made of the question.
+
+    ``related``: whether it continues the previous question (None: not said).
+    ``standalone``: the question made to stand alone, which the reranker
+    judges passages against; None when there is no usable line 1.
+    ``rewrites``: extra searches (lines 1-3, without copies of the question).
+    """
+    related: Optional[bool] = None
+    standalone: Optional[str] = None
+    rewrites: List[str] = field(default_factory=list)
+
+
+def parse_expansion(reply: str, question: str, has_previous: bool) -> Expansion:
+    """Read the RELATED line and the 3 numbered lines.
+
+    Line 1 is the question to rerank against. When the model says the
+    question is new (or there is no previous question), line 1 is the
+    question itself, whatever the model wrote there: asked to copy it, the
+    8B still sometimes "improved" it or wrote an answer.
+    """
+    related, lines = None, []
+    for raw in (reply or "").splitlines():
+        m = _RELATED_RE.match(raw)
+        if m:
+            related = m.group(1).lower() == "yes"
             continue
-        seen.add(key)
-        out.append(line[:300])
-        if len(out) >= MAX_REWRITES:
-            break
-    return out
+        line = _PREAMBLE_RE.sub("", _LIST_PREFIX_RE.sub("", raw).strip()).strip().strip('"\'').strip()
+        if len(line) >= 3:
+            lines.append(line[:300])
+    lines = lines[:MAX_REWRITES]
+    if not has_previous:
+        related = False
+    if related is False:
+        standalone = question
+        lines = [question] + lines[1:]
+    else:
+        standalone = lines[0] if lines else None
+    seen = {" ".join(question.lower().split())}
+    rewrites = []
+    for line in lines:
+        key = " ".join(line.lower().split())
+        if key not in seen:
+            seen.add(key)
+            rewrites.append(line)
+    return Expansion(related, standalone, rewrites)
 
 
-async def expand_question(env, question: str, history: List[Dict[str, str]]) -> List[str]:
-    """Rewrites of *question* to search with besides the question itself.
+def _previous_question(history: List[Dict[str, str]]) -> Optional[str]:
+    previous = [m["content"] for m in history if m.get("role") == "user"][-1:]
+    return previous[0] if previous else None
+
+
+async def expand_question(env, question: str, history: List[Dict[str, str]]) -> Expansion:
+    """Rewrites of *question* to search with besides the question itself,
+    and whether it continues the previous question.
 
     Different words find passages the student's wording misses, and the
     rewrite of a follow-up stands on its own. Best effort: any failure
     returns no rewrites and the question is searched as it is.
     """
+    previous = _previous_question(history)
     if not QUERY_EXPANSION:
-        return []
-    previous = [m["content"] for m in history if m.get("role") == "user"][-1:]
-    asked = f"Earlier question: {previous[0][:500]}\n" if previous else ""
+        return Expansion()
+    asked = f"Earlier question: {previous[:500]}\n" if previous else ""
     try:
         ai, _ = tutor_rag._bindings(env)
         reply = extract_reply(await ai.run(EXPANSION_MODEL, tutor_rag._js({
@@ -180,17 +210,80 @@ async def expand_question(env, question: str, history: List[Dict[str, str]]) -> 
         })))
     except Exception as exc:
         print(json.dumps({"level": "warn", "where": "tutor_chat.expand_question", "error": str(exc)[:200]}))
+        return Expansion()
+    return parse_expansion(reply, question, previous is not None)
+
+
+def rerank_query(question: str, history: List[Dict[str, str]], expansion: Expansion) -> str:
+    """What the reranker judges passages against: the question made to stand
+    alone (line 1); without one, the previous question with this one, or for a
+    first question, the question itself."""
+    if expansion.standalone:
+        return expansion.standalone
+    previous = _previous_question(history)
+    return f"{previous}\n{question}" if previous else question
+
+
+KEYWORD_BOOST = True
+KEYWORD_WEIGHT = 0.25
+MAX_KEYWORDS = 5
+KEYWORD_MAX_TOKENS = 60
+KEYWORD_PROMPT = """You pick the important keywords of a student's question, for a search engine.
+Keywords are the names, specific terms, numbers and dates that a passage answering the question must mention.
+Copy each keyword exactly as it is written in the question. Never add a word that is not in the question.
+Leave out question words and general words (what, which, how, many, much, does, the, best, most, today).
+Write one keyword or short phrase per line, at most 5. Write nothing else."""
+
+_KW_WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
+_KW_GENERIC = frozenset("""a an the of in on at to for from by with and or vs versus is are was were be been
+do does did has have had what which who whom whose when where why how many much it its this that these those
+as than more most less least first last best worst today current time year week s""".split())
+
+
+def _kw_stem(word: str) -> str:
+    """Light stemming, so "divorce", "divorced" and "divorces" match."""
+    if len(word) <= 4:
+        return word
+    word = re.sub(r"(ing|ed|es|s)$", "", word)
+    return word[:-1] if word.endswith("e") and len(word) > 4 else word
+
+
+def parse_keywords(reply: str, question: str) -> List[str]:
+    """The model's keyword lines, keeping only those whose words are all in
+    *question* (after light stemming) and that aren't only general words."""
+    allowed = {_kw_stem(w) for w in _KW_WORD_RE.findall((question or "").lower())}
+    out: List[str] = []
+    for line in (reply or "").splitlines():
+        keyword = _LIST_PREFIX_RE.sub("", line).strip().strip("\"'.,;:").strip()
+        words = _KW_WORD_RE.findall(keyword.lower())
+        if not words or len(words) > 6 or all(w in _KW_GENERIC for w in words):
+            continue
+        if not all(_kw_stem(w) in allowed for w in words):
+            continue
+        if keyword.lower() not in (k.lower() for k in out):
+            out.append(keyword[:80])
+        if len(out) >= MAX_KEYWORDS:
+            break
+    return out
+
+
+async def extract_keywords(env, question: str) -> List[str]:
+    """Keywords of *question* for the keyword boost. Best effort: any failure
+    returns none, and the reranker's order is used as it is."""
+    if not KEYWORD_BOOST:
         return []
-    return parse_rewrites(reply, question)
-
-
-def rerank_query(question: str, history: List[Dict[str, str]], rewrites: List[str]) -> str:
-    """What the reranker judges passages against: the question, or for a
-    follow-up, its stand-alone rewrite (or failing that, with the previous question)."""
-    previous = [m["content"] for m in history if m.get("role") == "user"][-1:]
-    if not previous:
-        return question
-    return rewrites[0] if rewrites else "\n".join(previous + [question])
+    try:
+        ai, _ = tutor_rag._bindings(env)
+        reply = extract_reply(await ai.run(EXPANSION_MODEL, tutor_rag._js({
+            "messages": [{"role": "system", "content": KEYWORD_PROMPT},
+                         {"role": "user", "content": f"Question: {question[:MAX_MESSAGE_CHARS]}"}],
+            "max_tokens": KEYWORD_MAX_TOKENS,
+            "temperature": 0,
+        })))
+    except Exception as exc:
+        print(json.dumps({"level": "warn", "where": "tutor_chat.extract_keywords", "error": str(exc)[:200]}))
+        return []
+    return parse_keywords(reply, question)
 
 
 def extract_reply(result: Any) -> str:
@@ -243,14 +336,7 @@ def apply_citations(answer: str, hits: List[Dict[str, Any]]):
     return cleaned, citations
 
 
-# A reply that says the sources lack the answer is a refusal in disguise
-# ("The sources do not provide Harvard's ratio [1]..."). It cites sources, so
-# the citation check passes it, and it was logged as an answer: 8 of the 15
-# "wrong" answers in the first CRAG run. This is checked in code rather than
-# by a stricter prompt: asking the model harder for "answer or NOT_IN_COURSE"
-# made hint-only mode give the answer away 3x as often in the eval set.
 _ADVERB = r"(?:\w+ly\s+)?"
-# Unambiguous: the sentence is about what the sources say.
 _SOURCES_LACK_RE = re.compile(
     r"\b(?:sources?|materials?|passages?|context|information|documents?|texts?)"
     r"(?:\s+(?:provided|given|available))?\s+(?:do|does|did)\s+not\s+" + _ADVERB +
@@ -261,8 +347,6 @@ _SOURCES_LACK_RE = re.compile(
     r"(?:mentions?|provides?|contains?|says?|gives?|about|of|on|regarding|is\s+(?:given|provided))"
     r"|\bI\s+(?:don't|do\s+not|cannot|can't|could\s+not|couldn't)\s+(?:know|find)",
     re.IGNORECASE)
-# Only a refusal when the same sentence refers to the sources: course text
-# itself can say "the exact age cannot be determined".
 _CANNOT_RE = re.compile(
     r"\b(?:cannot|can't|can\s+not|unable\s+to)\s+(?:be\s+)?" + _ADVERB +
     r"(?:be\s+)?(?:determined?|answer(?:ed)?|concluded?|calculated?)", re.IGNORECASE)
@@ -273,7 +357,7 @@ _WORD_RE = re.compile(r"[^\W_]", re.UNICODE)
 def says_sources_lack_answer(answer: str) -> bool:
     """True when any sentence of the answer says the sources don't have the answer."""
     text = _CITATION_RE.sub("", answer or "")
-    text = re.sub(r"\s+to\s+(?=\s|[.,;])", " ", text)   # "sources [1] to [5] do not" -> "sources do not"
+    text = re.sub(r"\s+to\s+(?=\s|[.,;])", " ", text)
     for sentence in _SENTENCE_RE.split(text):
         sentence = " ".join(sentence.split())
         if _SOURCES_LACK_RE.search(sentence):
@@ -304,13 +388,17 @@ def cited_fraction(answer: str) -> float:
 
 async def find_passages(env, activity_id: str, question: str, history: List[Dict[str, str]],
                         decrypt) -> List[Dict[str, Any]]:
-    """The passages the model gets: search with the question, the question with
-    the previous one, and the small model's rewrites; keep passages above
-    MIN_RELEVANCE for at least one of them; rerank against the question."""
-    rewrites = await expand_question(env, question, history)
-    return await tutor_rag.retrieve(env, activity_id, retrieval_queries(question, history), decrypt,
-                                    top_k=RETRIEVAL_K, min_score=MIN_RELEVANCE, extra_queries=rewrites,
-                                    rerank_query=rerank_query(question, history, rewrites))
+    """The passages the model gets: search with the question and the small
+    model's rewrites (which resolve a follow-up using the previous question);
+    keep passages above MIN_RELEVANCE for at least one of them; rerank against
+    the question made to stand alone, with a boost for passages containing
+    the question's keywords."""
+    expansion = await expand_question(env, question, history)
+    keywords = await extract_keywords(env, question)
+    return await tutor_rag.retrieve(env, activity_id, [question], decrypt,
+                                    top_k=RETRIEVAL_K, min_score=MIN_RELEVANCE, extra_queries=expansion.rewrites,
+                                    rerank_query=rerank_query(question, history, expansion),
+                                    keywords=keywords, keyword_weight=KEYWORD_WEIGHT)
 
 
 async def _chat(ai, messages: List[Dict[str, str]]) -> str:
@@ -417,7 +505,6 @@ async def answer(env, activity_id: str, course_title: str, question: str,
     if policy["mode"] == "hint_only":
         return await _hint_answer(ai, messages, reply, hits, question, history, result)
     if says_sources_lack_answer(reply):
-        # kept for the teacher's review log, like withheld text
         return result(NOT_FOUND_ANSWER, "not_found", model_called=True, withheld_text=reply)
     text, citations = apply_citations(reply, hits)
     if not citations or not has_words(text) or cited_fraction(text) < MIN_CITED_FRACTION:

@@ -29,9 +29,6 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 IDK = "I don't know"
 OUTCOMES = ("correct", "missing", "hallucination")
 
-# The tutor is told to correct a false premise rather than reply "invalid
-# question", so false-premise questions are also judged against this, as an
-# extra (non-CRAG) measure of whether it noticed the premise was false.
 FALSE_PREMISE_GOLD = "The question's premise is false, so it cannot be answered as asked."
 
 _MARKER_RE = re.compile(r"\s*\[\d{1,2}\]")
@@ -77,7 +74,7 @@ def parse_judge_reply(text: str) -> Dict[str, Any]:
     return {"score": -1, "explanation": "could not parse the judge's reply"}
 
 
-Judge = Callable[[str, str, str], Dict[str, Any]]   # (query, ground_truth, prediction) -> parsed reply
+Judge = Callable[[str, str, str], Dict[str, Any]]
 
 
 def score_prediction(query: str, golds: List[str], prediction: str, judge: Judge) -> Dict[str, Any]:

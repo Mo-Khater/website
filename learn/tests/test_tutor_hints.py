@@ -7,15 +7,10 @@ import pytest
 
 import tutor_chat
 import tutor_hints
-# Course fixture (indexed Biology 101, tutor enabled) shared with the chat tests.
 from tests.test_tutor_chat import _chat, _hit, _req, env, worker  # noqa: F401
 
 DIFFUSION = "Diffusion is passive and needs no energy from the cell. Active transport uses ATP."
 
-
-# ---------------------------------------------------------------------------
-# tutor_hints (pure)
-# ---------------------------------------------------------------------------
 
 class TestParseHintReply:
     def test_two_parts(self):
@@ -28,8 +23,8 @@ class TestParseHintReply:
 
     @pytest.mark.parametrize("reply", [
         "Plants release oxygen [1].",
-        "HINT: Look at [1]. Which gas?",          # no answer to check against
-        "ANSWER: oxygen [1]",                      # no hint
+        "HINT: Look at [1]. Which gas?",
+        "ANSWER: oxygen [1]",
         "ANSWER:\nHINT: Look at [1].",
     ])
     def test_missing_part(self, reply):
@@ -60,9 +55,7 @@ class TestHintLeaks:
         assert tutor_hints.hint_leaks("oxygen [1]", hint, "What gas do plants release?") == []
 
     def test_words_the_student_said_or_saw_are_not_leaks(self):
-        # a right guess can be confirmed
         assert tutor_hints.hint_leaks("oxygen [1]", "Yes, oxygen is right [1].", "Is it oxygen?") == []
-        # words of the question and of source titles don't count
         assert tutor_hints.hint_leaks("in the nucleus of the cell [1]", "Which part of the cell [1]?",
                                       "Where is DNA kept in a cell?") == []
 
@@ -70,14 +63,12 @@ class TestHintLeaks:
         assert tutor_hints.key_terms("Yes, it is [1]") == {}
 
     def test_copied_answer_sentence(self):
-        # "No" is too common to check; the copied sentence is still caught
         leaks = tutor_hints.hint_leaks("No, diffusion is passive [1]",
                                        "Source [1] says it needs no energy from the cell. So what does that mean?",
                                        "Does diffusion need energy from the cell?", [DIFFUSION])
         assert leaks == ['"needs no energy from the cell"']
 
     def test_copying_other_sentences_is_fine(self):
-        # the copied run is from a sentence that doesn't hold the answer
         leaks = tutor_hints.hint_leaks("passive [1]", "Compare with how active transport uses ATP [1]. Which needs it?",
                                        "Is diffusion active?", [DIFFUSION])
         assert leaks == []
@@ -94,10 +85,6 @@ def test_retry_note_names_the_leak_and_is_not_from_the_student():
     note = tutor_hints.retry_note("leak", ["oxygen"])
     assert "oxygen" in note and "not a message from the student" in note
 
-
-# ---------------------------------------------------------------------------
-# tutor_chat.check_hint
-# ---------------------------------------------------------------------------
 
 class TestCheckHint:
     HITS = [_hit(1, "Photosynthesis", "", "Water is split and oxygen is released."), _hit(2)]
@@ -128,15 +115,10 @@ class TestCheckHint:
         assert c["problem"] == "not_found"
 
     def test_hedged_hint_is_not_a_refusal(self):
-        # only the hidden answer decides "not found"; the hint may hedge
         c = self.check("ANSWER: oxygen [1]\nHINT: The sources don't state it directly, but [1] says what is "
                        "split. Which gas could be released?")
         assert c["problem"] is None
 
-
-# ---------------------------------------------------------------------------
-# Through the chat endpoint
-# ---------------------------------------------------------------------------
 
 async def _hint_policy(worker, env):
     resp = await worker._dispatch(_req(worker, env, "PUT", "/api/activities/act1/tutor/policy", "host1",
@@ -165,7 +147,6 @@ class TestHintEndpoint:
         assert data["answer"] == "Source [1] names a pigment in the leaf. What is it called?"
         assert "chlorophyll" not in data["answer"] and "ANSWER" not in data["answer"]
         assert len(env.AI.chat_calls) == 1
-        # the teacher's log keeps the hidden answer
         log = (await worker._dispatch(_req(worker, env, "GET", "/api/activities/act1/tutor/log", "host1"), env))
         entry = __import__("json").loads(log.body)["data"]["entries"][0]
         assert "ANSWER: chlorophyll [1]" in entry["withheld_text"]

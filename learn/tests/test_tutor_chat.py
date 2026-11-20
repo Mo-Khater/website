@@ -20,10 +20,6 @@ def _hit(n, title="Week 3 reading", locator="page 1", text="Some text."):
             "source_title": title, "locator": locator, "text": text, "score": 0.8}
 
 
-# ---------------------------------------------------------------------------
-# Pure helpers
-# ---------------------------------------------------------------------------
-
 class TestApplyCitations:
     def test_valid_markers_become_citations_in_order_of_use(self):
         hits = [_hit(1), _hit(2), _hit(3)]
@@ -78,46 +74,77 @@ class TestBuildMessages:
         assert system.index(tutor_policy.HINT_ONLY_RULE.strip()[:40]) < system.index(tutor_chat.HISTORY_RULE)
 
 
-class TestRetrievalQuery:
-    def test_follow_up_includes_previous_question(self):
-        history = [{"role": "user", "content": "What are alleles?"},
-                   {"role": "assistant", "content": "Variants of a gene [1]."}]
-        assert tutor_chat.retrieval_queries("And dominant ones?", history) == [
-            "And dominant ones?", "What are alleles?\nAnd dominant ones?"]
+class TestParseExpansion:
+    Q = "And dominant ones?"
 
-    def test_first_question(self):
-        assert tutor_chat.retrieval_queries("Q", []) == ["Q"]
+    def test_follow_up_is_made_to_stand_alone(self):
+        reply = "RELATED: yes\n1. What are dominant alleles?\n2. Dominant gene variants\n3. A dominant allele masks another."
+        e = tutor_chat.parse_expansion(reply, self.Q, has_previous=True)
+        assert e.related is True and e.standalone == "What are dominant alleles?"
+        assert e.rewrites == ["What are dominant alleles?", "Dominant gene variants", "A dominant allele masks another."]
 
+    def test_new_topic_is_reranked_as_asked_whatever_line_1_says(self):
+        reply = ("RELATED: no\n1. How are variable-length prefix codes constructed?\n"
+                 "2. Algorithm for constructing Huffman codes\n3. Huffman merges the two rarest symbols.")
+        e = tutor_chat.parse_expansion(reply, "How are Huffman codes built?", has_previous=True)
+        assert e.related is False and e.standalone == "How are Huffman codes built?"
+        assert e.rewrites == ["Algorithm for constructing Huffman codes", "Huffman merges the two rarest symbols."]
 
-class TestParseRewrites:
-    def test_numbering_quotes_and_preamble_are_removed(self):
-        reply = ('1. How do plants capture light energy?\n\n2) "Role of chlorophyll in photosynthesis"\n'
-                 '3. A passage answering this question might contain: "Chlorophyll absorbs light."')
-        assert tutor_chat.parse_rewrites(reply, "How do plants get energy?") == [
-            "How do plants capture light energy?", "Role of chlorophyll in photosynthesis",
-            "Chlorophyll absorbs light."]
+    def test_first_question_is_never_related(self):
+        e = tutor_chat.parse_expansion("RELATED: yes\n1. Something else?\n2. B b\n3. C c", "Q?", has_previous=False)
+        assert e.related is False and e.standalone == "Q?" and e.rewrites == ["B b", "C c"]
 
-    def test_copies_of_the_question_and_extra_lines_are_dropped(self):
-        reply = "how do plants get energy?\nA\nB b\nC c\nD d\nB  B"
-        assert tutor_chat.parse_rewrites(reply, "How do plants get  energy?") == ["B b", "C c", "D d"]
+    def test_missing_decision_trusts_line_1(self):
+        e = tutor_chat.parse_expansion("1. What are dominant alleles?\n2. B b", self.Q, has_previous=True)
+        assert e.related is None and e.standalone == "What are dominant alleles?"
+
+    def test_markdown_numbering_quotes_and_preamble_are_removed(self):
+        reply = ('**RELATED:** Yes\n\n1) "How do plants capture light energy?"\n- Role of chlorophyll\n'
+                 '3. A passage answering this question might contain: "Chlorophyll absorbs light."\n4. Extra line')
+        e = tutor_chat.parse_expansion(reply, "And how?", has_previous=True)
+        assert e.related is True
+        assert e.rewrites == ["How do plants capture light energy?", "Role of chlorophyll", "Chlorophyll absorbs light."]
 
     def test_long_lines_are_cut(self):
-        assert [len(r) for r in tutor_chat.parse_rewrites("x" * 900, "q")] == [300]
+        e = tutor_chat.parse_expansion("RELATED: yes\n" + "x" * 900, "q", has_previous=True)
+        assert [len(r) for r in e.rewrites] == [300]
+
+
+class TestParseKeywords:
+    Q = "What was the 76ers' record the year Allen Iverson won MVP?"
+
+    def test_keywords_from_the_question_are_kept(self):
+        reply = "1. Allen Iverson\n- MVP\n76ers\n\"record\""
+        assert tutor_chat.parse_keywords(reply, self.Q) == ["Allen Iverson", "MVP", "76ers", "record"]
+
+    def test_words_not_in_the_question_are_dropped(self):
+        assert tutor_chat.parse_keywords("Philadelphia\n2001\nMVP", self.Q) == ["MVP"]
+        assert tutor_chat.parse_keywords("Canberra", "What is the capital of Australia?") == []
+
+    def test_general_words_and_repeats_are_dropped(self):
+        assert tutor_chat.parse_keywords("the year\nWhat\nMVP\nmvp", self.Q) == ["MVP"]
+
+    def test_forms_of_a_word_match(self):
+        assert tutor_chat.parse_keywords("divorce", "How many times did Ross get divorced?") == ["divorce"]
+
+    def test_at_most_five(self):
+        q = "alpha beta gamma delta epsilon zeta eta"
+        assert len(tutor_chat.parse_keywords("\n".join(q.split()), q)) == tutor_chat.MAX_KEYWORDS
 
 
 class TestRerankQuery:
     HISTORY = [{"role": "user", "content": "What are alleles?"}, {"role": "assistant", "content": "Variants [1]."}]
 
-    def test_first_question_is_reranked_as_asked(self):
-        assert tutor_chat.rerank_query("What are alleles?", [], ["Gene variants"]) == "What are alleles?"
+    def test_the_stand_alone_question_is_used(self):
+        e = tutor_chat.Expansion(related=True, standalone="What are dominant alleles?", rewrites=[])
+        assert tutor_chat.rerank_query("And dominant ones?", self.HISTORY, e) == "What are dominant alleles?"
 
-    def test_follow_up_uses_its_stand_alone_rewrite(self):
-        assert tutor_chat.rerank_query("And dominant ones?", self.HISTORY,
-                                       ["What are dominant alleles?"]) == "What are dominant alleles?"
-
-    def test_follow_up_without_rewrites_adds_the_previous_question(self):
-        assert tutor_chat.rerank_query("And dominant ones?", self.HISTORY, []) == \
+    def test_without_rewrites_a_follow_up_adds_the_previous_question(self):
+        assert tutor_chat.rerank_query("And dominant ones?", self.HISTORY, tutor_chat.Expansion()) == \
             "What are alleles?\nAnd dominant ones?"
+
+    def test_without_rewrites_a_first_question_is_used_as_asked(self):
+        assert tutor_chat.rerank_query("What are alleles?", [], tutor_chat.Expansion()) == "What are alleles?"
 
 
 class TestCitedFraction:
@@ -125,7 +152,7 @@ class TestCitedFraction:
         ("Plants use chlorophyll to capture light [1]. They make glucose from it [2].", 1.0),
         ("Plants use chlorophyll to capture light [1]. The French Revolution began in 1789.", 0.5),
         ("The French Revolution began in 1789. It ended a monarchy in Europe.", 0.0),
-        ("Yes [1].", 1.0),          # too short to count as a sentence, but cited
+        ("Yes [1].", 1.0),
         ("Short reply.", 0.0),
     ])
     def test_fraction(self, answer, expected):
@@ -133,7 +160,6 @@ class TestCitedFraction:
 
 
 class TestSaysSourcesLackAnswer:
-    # Real Llama 3.3 replies from the CRAG run, logged as answers before this check.
     @pytest.mark.parametrize("answer", [
         "The provided sources do not contain information about the total number of number one hits [1][2].",
         "The current CEO of Salesforce is Marc Benioff [3]. However, the sources do not provide information "
@@ -156,7 +182,7 @@ class TestSaysSourcesLackAnswer:
     @pytest.mark.parametrize("answer", [
         "The movie \"Tenet\" won the Oscar for Best Visual Effects in 2021 [5].",
         "Mayon can be considered the most active, as it has the most recent eruption date [3].",
-        "The exact age of the fossil cannot be determined precisely [2].",   # course content, not a refusal
+        "The exact age of the fossil cannot be determined precisely [2].",
         "Plants do not need light for the Calvin cycle [1].",
         "Source [1] explains what the light reactions split. Which gas could be released?",
     ])
@@ -184,10 +210,6 @@ class TestExtractReply:
         assert tutor_chat.extract_reply(result) == expected
 
 
-# ---------------------------------------------------------------------------
-# Endpoint
-# ---------------------------------------------------------------------------
-
 @pytest.fixture
 def worker():
     return load_worker()
@@ -195,7 +217,6 @@ def worker():
 
 @pytest.fixture
 async def env(worker, monkeypatch):
-    # The fake bag-of-words embedder scores lower than the real model.
     monkeypatch.setattr(tutor_chat, "MIN_RELEVANCE", 0.2)
     env = SimpleNamespace(
         DB=SqliteD1(), AI=FakeAI(), VECTORIZE=FakeVectorize(), MY_BUCKET=FakeR2(),
@@ -255,7 +276,6 @@ class TestChatEndpoint:
         [cite] = data["citations"]
         assert (cite["n"], cite["source_type"], cite["source_id"]) == (1, "session", "s1")
         assert "chlorophyll" in cite["text"]
-        # the model saw the passage, numbered, inside the system prompt
         [(model, payload)] = env.AI.chat_calls
         assert model == tutor_chat.CHAT_MODEL
         assert "[1] Photosynthesis" in payload["messages"][0]["content"]
@@ -270,7 +290,7 @@ class TestChatEndpoint:
         assert all(r.content_encrypted.startswith("v1:") for r in rows)
         assert all(r.conversation_id == body["data"]["conversation_id"] for r in rows)
         assert rows[1].grounded == 1
-        assert "text" not in json.loads(rows[1].citations_json)[0]   # passage text not duplicated
+        assert "text" not in json.loads(rows[1].citations_json)[0]
 
     async def test_follow_up_uses_server_history(self, worker, env):
         env.AI.chat_responder = lambda msgs: "Chlorophyll [1]."
@@ -282,15 +302,37 @@ class TestChatEndpoint:
         assert [m["role"] for m in msgs] == ["system", "user", "assistant", "user"]
         assert msgs[1]["content"] == "How do plants capture sunlight?"
         assert msgs[2]["content"] == "Chlorophyll [1]."
-        # searched with the question alone (a new topic) and with the previous one (a follow-up)
         q = tutor_rag.QUERY_INSTRUCTION
-        assert env.AI.calls[-1][1] == [q + "And what do they make?",
-                                       q + "How do plants capture sunlight?\nAnd what do they make?"]
+        assert env.AI.calls[-1][1] == [q + "And what do they make?"]
+
+    async def test_follow_up_is_searched_and_reranked_as_the_stand_alone_question(self, worker, env, monkeypatch):
+        monkeypatch.setattr(tutor_chat, "MIN_RELEVANCE", 0.0)
+        env.AI.chat_responder = lambda msgs: "Chlorophyll [1]."
+        _, first = await _chat(worker, env, "student1", "How do plants capture sunlight?")
+        env.AI.expansion_responder = lambda msgs: ("RELATED: yes\n1. What do plants make with sunlight?\n"
+                                                   "2. Products of photosynthesis\n3. Plants make glucose.")
+        env.AI.rerank_calls.clear()
+        await _chat(worker, env, "student1", "And what do they make?", first["data"]["conversation_id"])
+        q = tutor_rag.QUERY_INSTRUCTION
+        assert env.AI.calls[-1][1] == [q + "And what do they make?", q + "What do plants make with sunlight?",
+                                       q + "Products of photosynthesis", q + "Plants make glucose."]
+        assert [query for _, query, _ in env.AI.rerank_calls] == ["What do plants make with sunlight?"]
+
+    async def test_new_topic_is_reranked_as_asked(self, worker, env, monkeypatch):
+        monkeypatch.setattr(tutor_chat, "MIN_RELEVANCE", 0.0)
+        env.AI.chat_responder = lambda msgs: "Chlorophyll [1]."
+        _, first = await _chat(worker, env, "student1", "How do plants capture sunlight?")
+        env.AI.expansion_responder = lambda msgs: ("RELATED: no\n1. What is the role of the cell?\n"
+                                                   "2. Cell function\n3. Cells are the units of life.")
+        env.AI.rerank_calls.clear()
+        await _chat(worker, env, "student1", "How do cells work?", first["data"]["conversation_id"])
+        assert [query for _, query, _ in env.AI.rerank_calls] == ["How do cells work?"]
 
     async def test_rewrites_are_searched_and_passages_reranked_against_the_question(self, worker, env, monkeypatch):
-        monkeypatch.setattr(tutor_chat, "MIN_RELEVANCE", 0.0)   # both passages are candidates
+        monkeypatch.setattr(tutor_chat, "MIN_RELEVANCE", 0.0)
         env.AI.rerank_responder = lambda q, texts: [0.9 if "glucose" in t else 0.2 for t in texts]
-        env.AI.expansion_responder = lambda msgs: "How do plants make glucose?\nPlant sugar production"
+        env.AI.expansion_responder = lambda msgs: ("RELATED: no\n1. Where does plant food come from?\n"
+                                                   "2. How do plants make glucose?\n3. Plant sugar production")
         env.AI.chat_responder = lambda msgs: "Chlorophyll [1]."
         status, body = await _chat(worker, env, "student1", "Where does plant food come from?")
         assert status == 200 and body["data"]["outcome"] == "answered", body
@@ -325,6 +367,33 @@ class TestChatEndpoint:
         status, body = await _chat(worker, env, "student1", "How do plants capture sunlight?")
         assert status == 200 and body["data"]["outcome"] == "answered", body
 
+    async def test_keywords_move_the_passage_that_contains_them_first(self, worker, env, monkeypatch):
+        monkeypatch.setattr(tutor_chat, "MIN_RELEVANCE", 0.0)
+        env.AI.rerank_responder = lambda q, texts: [0.6 if "Cells" in t else 0.5 for t in texts]
+        env.AI.chat_responder = lambda msgs: "Glucose [1]."
+        _, plain = await _chat(worker, env, "student1", "Do cells make glucose?")
+        assert plain["data"]["citations"][0]["source_id"] == "act1"
+        env.AI.keyword_responder = lambda msgs: "glucose\nsugar"
+        _, boosted = await _chat(worker, env, "student1", "Do cells make glucose?")
+        assert boosted["data"]["citations"][0]["source_id"] == "s1"
+        payload = env.AI.keyword_calls[-1][1]
+        assert payload["messages"][0]["content"] == tutor_chat.KEYWORD_PROMPT
+        assert payload["messages"][-1]["content"] == "Question: Do cells make glucose?"
+
+    async def test_keyword_model_failure_still_answers(self, worker, env):
+        def broken(msgs):
+            raise RuntimeError("model unavailable")
+        env.AI.keyword_responder = broken
+        env.AI.chat_responder = lambda msgs: "Plants capture sunlight with chlorophyll [1]."
+        status, body = await _chat(worker, env, "student1", "How do plants capture sunlight?")
+        assert status == 200 and body["data"]["outcome"] == "answered", body
+
+    async def test_keyword_boost_off_switch(self, worker, env, monkeypatch):
+        monkeypatch.setattr(tutor_chat, "KEYWORD_BOOST", False)
+        env.AI.chat_responder = lambda msgs: "Plants capture sunlight with chlorophyll [1]."
+        await _chat(worker, env, "student1", "How do plants capture sunlight?")
+        assert env.AI.keyword_calls == []
+
     async def test_cannot_continue_someone_elses_conversation(self, worker, env):
         _, first = await _chat(worker, env, "student1", "How do plants capture sunlight?")
         status, body = await _chat(worker, env, "student2", "Next?", first["data"]["conversation_id"])
@@ -343,7 +412,6 @@ class TestChatEndpoint:
         assert env.AI.chat_calls == []
 
     async def test_model_says_not_in_course(self, worker, env):
-        # Seen in the eval: refusals cited "[1] to [5]" and were logged as answers.
         env.AI.chat_responder = lambda msgs: "NOT_IN_COURSE"
         _, body = await _chat(worker, env, "student1", "How do plants capture sunlight with CRISPR?")
         assert env.AI.chat_calls
@@ -364,7 +432,6 @@ class TestChatEndpoint:
         assert row.outcome == "not_found" and row.withheld_encrypted.startswith("v1:")
 
     async def test_citation_markers_only_is_withheld(self, worker, env):
-        # Seen with Llama 3.1 8B in the CRAG run: the whole reply was "[1]".
         env.AI.chat_responder = lambda msgs: "[1]"
         _, body = await _chat(worker, env, "student1", "How do plants capture sunlight?")
         assert body["data"]["outcome"] == "withheld"
@@ -383,8 +450,6 @@ class TestChatEndpoint:
         assert body["data"]["citations"] == []
 
     async def test_prompt_injection_essay_is_withheld(self, worker, env):
-        # Seen live: Llama obeyed "ignore all previous instructions" and wrote an
-        # uncited essay. Whatever the model writes, uncited text never reaches the student.
         essay = ("The French Revolution began in 1789. It overthrew the monarchy in France. "
                  "The Reign of Terror followed soon after. Napoleon later seized power.")
         env.AI.chat_responder = lambda msgs: essay

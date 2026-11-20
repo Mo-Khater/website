@@ -18,10 +18,6 @@ from tests.helpers import MockRequest, load_worker
 from tests.tutor_fakes import FakeAI, FakeR2, FakeVectorize, SqliteD1, _identity
 
 
-# ---------------------------------------------------------------------------
-# Pure helpers
-# ---------------------------------------------------------------------------
-
 class TestChunkText:
     def test_empty(self):
         assert tutor_rag.chunk_text("") == []
@@ -94,7 +90,7 @@ class TestBuildChunks:
         assert chunks[0]["text"].startswith("## Mitosis Cell division. Mitosis makes")
 
     def test_sections_too_big_to_share_a_chunk_stay_apart(self):
-        big = "Word " * 239   # 1,194 characters: fits one chunk, but not with "Short."
+        big = "Word " * 239
         src = [{"source_type": "material", "source_id": "m", "title": "Notes", "sections": [
             {"locator": "section: A", "text": "Short."}, {"locator": "section: B", "text": big}]}]
         assert [c["locator"] for c in tutor_rag.build_chunks("a", src)] == ["section: A", "section: B"]
@@ -119,14 +115,68 @@ class TestBuildChunks:
         assert tutor_rag.build_chunks("a", [{"source_type": "session", "source_id": "1", "text": ""}]) == []
 
 
-# ---------------------------------------------------------------------------
-# File extraction
-# ---------------------------------------------------------------------------
-
 _A = "http://schemas.openxmlformats.org/drawingml/2006/main"
 _P = "http://schemas.openxmlformats.org/presentationml/2006/main"
 _R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 _REL = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+
+class TestSemanticSplitting:
+    def test_sentences_follow_paragraphs_and_long_ones_are_cut(self):
+        text = "One. Two!\n\nThree? " + "x" * 30
+        assert tutor_rag.sentences_of(text, max_chars=12) == ["One.", "Two!", "Three?", "x" * 12, "x" * 12, "x" * 6]
+
+    def test_chunk_ends_at_the_biggest_change_of_topic(self):
+        sentences = [f"s{i} " + "w" * 96 for i in range(10)]
+        distances = [0.1, 0.1, 0.1, 0.1, 0.9, 0.1, 0.1, 0.1, 0.1]
+        chunks = tutor_rag.pack_sentences(sentences, distances, min_chars=200, max_chars=700)
+        assert chunks[0] == " ".join(sentences[:5])
+        assert " ".join(chunks) == " ".join(sentences)
+
+    def test_no_cut_before_the_minimum_and_none_past_the_maximum(self):
+        sentences = [f"s{i} " + "w" * 96 for i in range(10)]
+        distances = [0.9, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+        chunks = tutor_rag.pack_sentences(sentences, distances, min_chars=300, max_chars=450)
+        assert all(len(c) <= 450 for c in chunks)
+        assert len(chunks[0]) >= 300
+        assert " ".join(chunks) == " ".join(sentences)
+
+    def test_one_sentence_is_one_chunk(self):
+        assert tutor_rag.pack_sentences(["Only one."], []) == ["Only one."]
+
+
+class TestKeywordBoost:
+    @staticmethod
+    def _hits(*texts, scores=None):
+        scores = scores or [0.9 - i * 0.05 for i in range(len(texts))]
+        return [{"chunk_id": str(i), "source_title": "Title", "text": t, "rerank_score": sc}
+                for i, (t, sc) in enumerate(zip(texts, scores))]
+
+    def test_passage_with_a_rare_keyword_moves_up(self):
+        hits = self._hits("The 76ers history.", "Allen Iverson career.", "Allen Iverson won MVP; the 76ers went 56-26.")
+        out = tutor_rag.keyword_boost(hits, ["MVP", "Allen Iverson"], 0.25)
+        assert out[0]["chunk_id"] == "2" and out[0]["keyword_coverage"] > 0
+
+    def test_keyword_every_passage_has_changes_nothing(self):
+        hits = self._hits("Mitosis one.", "Mitosis two.", "Mitosis three.")
+        out = tutor_rag.keyword_boost(hits, ["mitosis"], 0.5)
+        assert [h["chunk_id"] for h in out] == ["0", "1", "2"]
+
+    def test_title_does_not_count(self):
+        hits = self._hits("Plain text.", "More text.")
+        hits[1]["source_title"] = "Mitosis"
+        out = tutor_rag.keyword_boost(hits, ["mitosis"], 0.5)
+        assert [h["chunk_id"] for h in out] == ["0", "1"]
+
+    def test_plurals_and_hyphens_match(self):
+        hits = self._hits("Nothing here.", "Two sodium potassium pumps per cell.")
+        out = tutor_rag.keyword_boost(hits, ["sodium-potassium pump"], 0.25)
+        assert out[0]["chunk_id"] == "1"
+
+    def test_no_keywords_or_no_weight_keeps_the_order(self):
+        hits = self._hits("A text.", "B text.")
+        assert tutor_rag.keyword_boost(hits, [], 0.5) == hits
+        assert tutor_rag.keyword_boost(hits, ["B"], 0) == hits
 
 
 def _shape(paragraphs, ph_type=None):
@@ -156,14 +206,12 @@ def make_pptx(slides, order=None, with_presentation=True):
                            for n in range(1, len(slides) + 1))
             zf.writestr("ppt/_rels/presentation.xml.rels", f'<Relationships xmlns="{_REL}">{rels}</Relationships>')
         for n, (paragraphs, notes) in enumerate(slides, start=1):
-            # like real decks: content + a footer and slide-number placeholder
             zf.writestr(f"ppt/slides/slide{n}.xml", _text_part("p:sld", [
                 _shape(paragraphs), _shape(["Confidential"], "ftr"), _shape([str(n)], "sldNum")]))
             if notes is not None:
                 zf.writestr(f"ppt/slides/_rels/slide{n}.xml.rels",
                             f'<Relationships xmlns="{_REL}"><Relationship Id="rId9" '
                             f'Type="{_R}/notesSlide" Target="../notesSlides/notesSlide{n}.xml"/></Relationships>')
-                # like LibreOffice: notes body + slide image + "<number>" placeholder
                 zf.writestr(f"ppt/notesSlides/notesSlide{n}.xml", _text_part("p:notes", [
                     _shape([], "sldImg"), _shape(notes, "body"), _shape(["&lt;number&gt;"], "sldNum")]))
     return buf.getvalue()
@@ -226,7 +274,7 @@ class TestExtractFileSections:
         sections, reason = await tutor_rag.extract_file_sections(env, bucket, "/notes/week1.txt")
         assert reason is None
         assert sections == [{"locator": "", "text": "Osmosis moves water across membranes."}]
-        assert env.AI.calls == []   # no AI call for plain text
+        assert env.AI.calls == []
 
     async def test_markdown_located_by_heading(self):
         bucket = FakeR2({"n.md": b"# Osmosis\nWater moves."})
@@ -278,11 +326,11 @@ class TestExtractFileSections:
         sections, reason = await tutor_rag.extract_file_sections(self._env(), FakeR2(), "gone.txt")
         assert sections == [] and "not found" in reason
 
-    async def test_oversized_file(self, monkeypatch):
-        monkeypatch.setattr(tutor_rag, "MAX_FILE_BYTES", 10)
-        bucket = FakeR2({"big.txt": b"x" * 11})
+    async def test_large_file_is_read(self):
+        bucket = FakeR2({"big.txt": b"word " * (11 * 1024 * 1024 // 5)})
         sections, reason = await tutor_rag.extract_file_sections(self._env(), bucket, "big.txt")
-        assert sections == [] and "larger than" in reason
+        assert reason is None
+        assert len(sections[0]["text"]) == tutor_rag.MAX_EXTRACTED_CHARS
 
     async def test_no_bucket(self):
         sections, reason = await tutor_rag.extract_file_sections(self._env(), None, "a.txt")
@@ -294,10 +342,6 @@ class TestExtractFileSections:
         sections, _ = await tutor_rag.extract_file_sections(self._env(), FakeR2({"d.pptx": data}), "d.pptx")
         assert [len(s["text"]) for s in sections] == [20, 5]
 
-
-# ---------------------------------------------------------------------------
-# Indexing and retrieval against the fakes
-# ---------------------------------------------------------------------------
 
 @pytest.fixture
 def worker():
@@ -342,6 +386,84 @@ class TestCleanText:
                 "text": "Read [chapter 2](https://example.org/very/long/path?id=1) on enzymes."}]
         [chunk] = tutor_rag.build_chunks("a", src)
         assert chunk["text"] == "Read chapter 2 on enzymes."
+
+
+PLANTS = ["Plants capture sunlight with chlorophyll in their green leaves every day.",
+          "Chlorophyll in leaves absorbs sunlight so plants can make glucose sugar.",
+          "Leaves take carbon dioxide and water and plants turn them into glucose.",
+          "Green plants store the glucose from sunlight as starch in their leaves.",
+          "Sunlight and chlorophyll let leaves of plants make glucose and oxygen gas.",
+          "Plants release oxygen from their leaves while chlorophyll uses sunlight.",
+          "Without sunlight the chlorophyll in plant leaves cannot make any glucose.",
+          "Plants in shade grow larger leaves to catch more sunlight for chlorophyll."]
+CELLS = ["During mitosis the nucleus divides and chromosomes separate into two sets.",
+         "Chromosomes line up in the middle before mitosis pulls the copies apart.",
+         "Each daughter nucleus after mitosis has identical chromosomes and genes.",
+         "Mitosis lets a dividing nucleus pass chromosomes to both daughter nuclei.",
+         "Spindle fibres pull chromosomes to opposite poles of the dividing nucleus.",
+         "After mitosis the cell membrane pinches so two nuclei become two daughters.",
+         "Chromosomes condense at the start of mitosis so the nucleus can divide them.",
+         "Errors in mitosis leave a daughter nucleus with the wrong chromosome count."]
+WATER = ["Rain falls from clouds and fills rivers that flow down to the sea.",
+         "The sun warms the sea so water evaporates and rises as vapour into clouds.",
+         "Water vapour cools high in the sky and condenses into droplets of cloud.",
+         "Rivers carry rain water from hills and mountains back down to the ocean.",
+         "Snow on mountains melts in spring and the water runs into lakes and rivers.",
+         "Clouds drift over land and drop their water as rain, snow or hail on hills.",
+         "Some rain soaks into the ground and flows slowly underground to the rivers.",
+         "Lakes and oceans lose water to evaporation on hot and windy summer days."]
+TOPICS = PLANTS + CELLS + WATER
+LONG_SECTION = [{"source_type": "material", "source_id": "m1", "title": "Notes", "text": " ".join(TOPICS)}]
+
+
+class TestSemanticChunking:
+    async def test_long_section_is_split_where_the_topic_changes(self, env, monkeypatch):
+        topic_words = [{"plants", "leaves", "chlorophyll", "sunlight", "glucose"},
+                       {"mitosis", "chromosomes", "nucleus", "nuclei", "daughter"},
+                       {"rain", "rivers", "water", "clouds", "sea", "ocean"}]
+
+        async def by_topic(env, texts):
+            words = [set(t.lower().replace(".", " ").replace(",", " ").split()) for t in texts]
+            return [[len(w & tw) + 0.01 for tw in topic_words] for w in words]
+        monkeypatch.setattr(tutor_rag, "embed_texts", by_topic)
+        stats = await tutor_rag.index_activity(env, "bio", LONG_SECTION, _identity)
+        rows = (await env.DB.prepare("SELECT text_encrypted FROM tutor_chunks ORDER BY chunk_index").all()).results
+        texts = [r.text_encrypted for r in rows]
+        assert stats["chunks"] == len(texts) >= 2
+        assert all(len(t) <= tutor_rag.CHUNK_MAX_CHARS for t in texts)
+        assert texts[0].startswith(" ".join(PLANTS))
+        assert texts[0] in (" ".join(PLANTS), " ".join(PLANTS + CELLS[:1]))
+        assert " ".join(texts) == " ".join(TOPICS)
+
+    async def test_sentences_are_embedded_with_their_neighbours(self, env):
+        await tutor_rag.index_activity(env, "bio", LONG_SECTION, _identity)
+        windows = env.AI.calls[0][1]
+        assert windows[0] == " ".join(PLANTS[:2]) and windows[1] == " ".join(PLANTS[:3])
+        assert len(windows) == len(TOPICS)
+
+    async def test_short_sections_cost_no_extra_embedding(self, env):
+        await tutor_rag.index_activity(env, "bio", BIO, _identity)
+        assert len(env.AI.calls) == 1
+
+    async def test_reindex_finds_the_same_chunks(self, env):
+        await tutor_rag.index_activity(env, "bio", LONG_SECTION, _identity)
+        env.AI.calls.clear()
+        stats = await tutor_rag.index_activity(env, "bio", LONG_SECTION, _identity)
+        assert stats["embedded"] == 0
+        assert len(env.AI.calls) == 1
+
+    async def test_failed_sentence_embedding_falls_back_to_plain_splitting(self, env, monkeypatch):
+        async def broken(env, sources):
+            raise RuntimeError("AI down")
+        monkeypatch.setattr(tutor_rag, "semantic_pieces", broken)
+        await tutor_rag.index_activity(env, "bio", LONG_SECTION, _identity)
+        rows = (await env.DB.prepare("SELECT text_encrypted FROM tutor_chunks ORDER BY chunk_index").all()).results
+        assert [r.text_encrypted for r in rows] == tutor_rag.chunk_text(LONG_SECTION[0]["text"])
+
+    async def test_off_switch(self, env, monkeypatch):
+        monkeypatch.setattr(tutor_rag, "SEMANTIC_CHUNKING", False)
+        await tutor_rag.index_activity(env, "bio", LONG_SECTION, _identity)
+        assert len(env.AI.calls) == 1
 
 
 class TestIndexAndRetrieve:
@@ -420,7 +542,7 @@ class TestIndexAndRetrieve:
         assert hit["source_id"] == "s2" and hit["rerank_score"] == 0.9
         [(model, query, texts)] = env.AI.rerank_calls
         assert (model, query, len(texts)) == (tutor_rag.RERANK_MODEL, "How do cells divide?", 3)
-        assert texts[0].startswith("Photosynthesis\n")   # passages carry their title, as when embedded
+        assert texts[0].startswith("Photosynthesis\n")
 
     async def test_reranker_failure_keeps_vector_order(self, env):
         await tutor_rag.index_activity(env, "bio", BIO, _identity)
@@ -436,12 +558,29 @@ class TestIndexAndRetrieve:
         hits = await tutor_rag.retrieve(env, "bio", "chlorophyll sunlight carbon dioxide", _identity,
                                         top_k=5, min_score=0.5, rerank_query="q")
         assert [h["source_id"] for h in hits] == ["s1"]
-        assert env.AI.rerank_calls == []   # one candidate: nothing to reorder
+        assert env.AI.rerank_calls == []
 
     async def test_no_reranking_unless_asked(self, env):
         await tutor_rag.index_activity(env, "bio", BIO, _identity)
         await tutor_rag.retrieve(env, "bio", "chlorophyll sunlight", _identity, top_k=2)
         assert env.AI.rerank_calls == []
+
+    async def test_keywords_move_a_passage_above_the_rerankers_choice(self, env):
+        await tutor_rag.index_activity(env, "bio", BIO, _identity)
+        env.AI.rerank_responder = lambda q, texts: [0.6 if "Biology" in t else 0.5 for t in texts]
+        hits = await tutor_rag.retrieve(env, "bio", "cells living things chromosomes", _identity, top_k=3,
+                                        rerank_query="q")
+        assert hits[0]["source_id"] == "bio"
+        hits = await tutor_rag.retrieve(env, "bio", "cells living things chromosomes", _identity, top_k=3,
+                                        rerank_query="q", keywords=["chromosomes"], keyword_weight=0.25)
+        assert hits[0]["source_id"] == "s2" and hits[0]["keyword_coverage"] == 1.0
+
+    async def test_keywords_need_the_reranked_pool(self, env):
+        await tutor_rag.index_activity(env, "bio", BIO, _identity)
+        plain = await tutor_rag.retrieve(env, "bio", "cells living things", _identity, top_k=2)
+        boosted = await tutor_rag.retrieve(env, "bio", "cells living things", _identity, top_k=2,
+                                           keywords=["chromosomes"], keyword_weight=0.5)
+        assert [h["chunk_id"] for h in boosted] == [h["chunk_id"] for h in plain]
 
     async def test_retrieve_several_queries_keeps_each_chunks_best_score(self, env):
         await tutor_rag.index_activity(env, "bio", BIO, _identity)
@@ -468,10 +607,6 @@ class TestIndexAndRetrieve:
         with pytest.raises(tutor_rag.TutorNotConfigured):
             await tutor_rag.retrieve(env, "bio", "q", _identity)
 
-
-# ---------------------------------------------------------------------------
-# HTTP endpoints
-# ---------------------------------------------------------------------------
 
 async def _seed(worker, env):
     enc = env.ENCRYPTION_KEY
@@ -545,8 +680,6 @@ class TestTutorEndpoints:
         resp = await worker._dispatch(_req(worker, env, "POST", "/api/activities/act1/tutor/reindex", HOST), env)
         assert resp.status == 200, resp.body
         data = json.loads(resp.body)["data"]
-        # activity description + objectives (both short, so one chunk), session,
-        # handout, pdf, 2 slides (the image and the link contribute no text)
         assert {k: data[k] for k in ("chunks", "embedded", "unchanged", "removed")} == \
             {"chunks": 6, "embedded": 6, "unchanged": 0, "removed": 0}
         assert sorted((f["material_id"], f["reason"]) for f in data["skipped_files"]) == [
@@ -573,7 +706,7 @@ class TestTutorEndpoints:
         await _seed(worker, env)
         [hit] = await self._search(worker, env, "dominant+recessive+alleles+heterozygotes")
         assert (hit["source_id"], hit["source_title"], hit["locator"]) == ("m5", "Genetics deck", "slide 2")
-        assert "Punnett square" in hit["text"]   # speaker notes come along
+        assert "Punnett square" in hit["text"]
 
     async def test_learning_objectives_are_searchable(self, worker, env):
         await _seed(worker, env)
@@ -595,7 +728,7 @@ class TestTutorEndpoints:
         results = json.loads(resp.body)["data"]["results"]
         assert results[0]["source_type"] == "session"
         assert results[0]["source_id"] == "s1"
-        assert "chlorophyll" in results[0]["text"]   # decrypted for the caller
+        assert "chlorophyll" in results[0]["text"]
 
     async def test_unenrolled_user_is_refused(self, worker, env):
         await _seed(worker, env)

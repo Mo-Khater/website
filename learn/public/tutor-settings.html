@@ -23,7 +23,6 @@
     </div>
 
     <div id="panel" class="hidden space-y-8">
-      <!-- Settings -->
       <section class="bg-white dark:bg-gray-800 rounded-lg shadow p-6 border border-gray-100 dark:border-gray-700" aria-labelledby="settings-heading">
         <h2 id="settings-heading" class="text-xl font-bold mb-4">Settings</h2>
         <form id="policy-form" class="space-y-6" novalidate>
@@ -85,7 +84,6 @@
         </form>
       </section>
 
-      <!-- Materials index -->
       <section class="bg-white dark:bg-gray-800 rounded-lg shadow p-6 border border-gray-100 dark:border-gray-700" aria-labelledby="index-heading">
         <h2 id="index-heading" class="text-xl font-bold mb-2">Course materials</h2>
         <p class="text-sm text-gray-600 dark:text-gray-300 mb-4">
@@ -98,7 +96,6 @@
         <div id="reindex-result" class="mt-4 text-sm" role="status" aria-live="polite"></div>
       </section>
 
-      <!-- Try it -->
       <section class="bg-white dark:bg-gray-800 rounded-lg shadow p-6 border border-gray-100 dark:border-gray-700" aria-labelledby="try-heading">
         <h2 id="try-heading" class="text-xl font-bold mb-2">Try it</h2>
         <p class="text-sm text-gray-600 dark:text-gray-300 mb-4">Ask what a student might ask. This uses your saved settings. Your questions don't count toward any limit.</p>
@@ -110,7 +107,6 @@
         </form>
       </section>
 
-      <!-- Review log -->
       <section class="bg-white dark:bg-gray-800 rounded-lg shadow p-6 border border-gray-100 dark:border-gray-700" aria-labelledby="log-heading">
         <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
           <h2 id="log-heading" class="text-xl font-bold">Review log</h2>
@@ -162,7 +158,7 @@
                              (options || {}).headers || {})
     }));
     let data = {};
-    try { data = await res.json(); } catch (e) { /* non-JSON error page */ }
+    try { data = await res.json(); } catch (e) { }
     if (!res.ok) throw new Error(data.error || ('Request failed (' + res.status + ')'));
     return data.data;
   }
@@ -178,7 +174,6 @@
     el.className = 'text-sm ' + (isError ? 'text-red-600 dark:text-red-400' : 'text-gray-500 dark:text-gray-400');
   }
 
-  // ---------------------------------------------------------------- settings
   function renderTopics() {
     $('p-topics').innerHTML = topics.map((t, i) =>
       '<li class="inline-flex items-center gap-1 pl-3 pr-1 py-1 rounded-full bg-gray-100 dark:bg-gray-700 text-sm">' + esc(t) +
@@ -234,7 +229,6 @@
     }
   });
 
-  // ------------------------------------------------------------------ index
   $('reindex').addEventListener('click', async () => {
     const out = $('reindex-result');
     $('reindex').disabled = true;
@@ -255,7 +249,6 @@
     }
   });
 
-  // Answers with clickable [n] sources come from the shared /js/tutor-answer.js.
   const answerHtml = (answer, citations, withText) => A1Tutor.answerHtml(answer, citations, { withText: withText });
 
   function badge(outcome) {
@@ -263,7 +256,6 @@
     return '<span class="inline-block px-2 py-0.5 rounded-full text-xs font-medium ' + o.cls + '">' + esc(o.label) + '</span>';
   }
 
-  // ------------------------------------------------------------------ try it
   $('try-form').addEventListener('submit', async e => {
     e.preventDefault();
     const message = $('try-input').value.trim();
@@ -290,7 +282,6 @@
     }
   });
 
-  // -------------------------------------------------------------- review log
   function logEntryHtml(e) {
     const when = new Date(e.created_at.replace(' ', 'T') + 'Z');
     const withheld = e.withheld_text
@@ -326,7 +317,6 @@
   $('log-filter').addEventListener('change', () => loadLog(true));
   $('log-more').addEventListener('click', () => loadLog(false));
 
-  // -------------------------------------------------------------------- init
   async function init() {
     if (!token) {
       sessionStorage.setItem('post_login_redirect', '/tutor-settings' + location.search);

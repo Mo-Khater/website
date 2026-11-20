@@ -24,10 +24,21 @@ Citations
 Chunking
   Text is cleaned first: Markdown links keep their text but lose the URL,
   images keep their alt text. Short sections (but not slides) join their
-  neighbours, so a heading's few lines aren't cut off from what follows. Sections are split
-  at paragraphs, then sentences, with some overlap. A chunk whose text
+  neighbours, so a heading's few lines aren't cut off from what follows.
+  A section that fits in one chunk is one chunk. A longer one is split by
+  meaning (semantic chunking): each sentence is embedded with its
+  neighbours, and a chunk ends at the biggest change of topic once it has
+  SEMANTIC_MIN_CHARS. If that embedding fails, sections are split at
+  paragraphs, then sentences, with some overlap. A chunk whose text
   already appears elsewhere in the course (a repeated footer or menu) is
   indexed once.
+
+Retrieval
+  Vector search with the question (and rewrites of it), then a reranker
+  orders the candidates against the question. A caller can pass keywords
+  of the question: candidates whose text contains them, especially the
+  rarer ones, move up (keyword_boost). Matching runs on the candidates'
+  decrypted text at query time; no keyword index is stored.
 
 Embeddings come from Workers AI (binding ``AI``).
 """
@@ -35,6 +46,7 @@ Embeddings come from Workers AI (binding ``AI``).
 import hashlib
 import io
 import json
+import math
 import posixpath
 import re
 import zipfile
@@ -44,24 +56,26 @@ from xml.etree import ElementTree
 import js
 from pyodide.ffi import to_js
 
-EMBED_MODEL = "@cf/baai/bge-base-en-v1.5"   # 768 dimensions, cosine
+EMBED_MODEL = "@cf/baai/bge-base-en-v1.5"
 EMBED_DIMENSIONS = 768
 
 CHUNK_MAX_CHARS = 1200
 CHUNK_OVERLAP_CHARS = 200
-MIN_SECTION_CHARS = 300          # a shorter section joins its neighbour
-MAX_CHUNKS_PER_ACTIVITY = 2000   # hard cap so one course can't run up the AI bill
+MIN_SECTION_CHARS = 300
+SEMANTIC_CHUNKING = True
+SEMANTIC_MIN_CHARS = 400
+MAX_SEMANTIC_SENTENCES = 5000
+MAX_CHUNKS_PER_ACTIVITY = 2000
 EMBED_BATCH_SIZE = 50
 UPSERT_BATCH_SIZE = 500
-SQL_IN_BATCH_SIZE = 50           # D1 allows at most 100 bound parameters
+SQL_IN_BATCH_SIZE = 50
 MAX_QUERY_CHARS = 1000
 MAX_TOP_K = 20
 
-# BGE v1.5's instruction for short queries searching for passages
 QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
-RERANK_MODEL = "@cf/baai/bge-reranker-base"   # cross-encoder, $0.003 per M tokens
-RERANK_CANDIDATES = 20           # vector hits the reranker reorders
-RERANK_MAX_CHARS = 1600          # the reranker reads at most 512 tokens of query + passage
+RERANK_MODEL = "@cf/baai/bge-reranker-base"
+RERANK_CANDIDATES = 20
+RERANK_MAX_CHARS = 1600
 
 SOURCE_TYPES = ("activity", "session", "material", "quiz_explanation")
 
@@ -71,10 +85,6 @@ Crypt = Callable[[str], Awaitable[str]]
 class TutorNotConfigured(RuntimeError):
     """Raised when the AI or VECTORIZE binding is missing."""
 
-
-# ---------------------------------------------------------------------------
-# Pure helpers (no I/O) — easy to unit test
-# ---------------------------------------------------------------------------
 
 _PARA_SPLIT_RE = re.compile(r"\n\s*\n")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
@@ -198,15 +208,101 @@ def source_sections(src: Dict[str, Any]) -> List[Dict[str, str]]:
     return [{"locator": "", "text": str(src.get("text") or "")}]
 
 
-def build_chunks(activity_id: str, sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def prepared_sections(src: Dict[str, Any]) -> List[Dict[str, str]]:
+    """A source's sections as they are chunked: cleaned, short ones merged."""
+    return merge_short_sections([{"locator": sec["locator"], "text": clean_text(sec["text"])}
+                                 for sec in source_sections(src)])
+
+
+def sentences_of(text: str, max_chars: int = CHUNK_MAX_CHARS) -> List[str]:
+    """Sentences of *text*, paragraph by paragraph; one longer than *max_chars* is cut."""
+    out: List[str] = []
+    for para in _PARA_SPLIT_RE.split((text or "").replace("\r\n", "\n")):
+        para = _WS_RE.sub(" ", para).strip()
+        for sentence in _SENTENCE_SPLIT_RE.split(para) if para else []:
+            sentence = sentence.strip()
+            while len(sentence) > max_chars:
+                out.append(sentence[:max_chars])
+                sentence = sentence[max_chars:].strip()
+            if sentence:
+                out.append(sentence)
+    return out
+
+
+def pack_sentences(sentences: List[str], distances: List[float], min_chars: int = SEMANTIC_MIN_CHARS,
+                   max_chars: int = CHUNK_MAX_CHARS) -> List[str]:
+    """Group *sentences* into chunks of at most *max_chars*, each ending at the
+    biggest change of topic once it has *min_chars*.
+
+    ``distances[i]`` is how far apart in meaning sentences i and i+1 are. The
+    chunks don't overlap: they end where the topic changes, so there is less
+    to lose at the edges than with fixed-size cuts.
+    """
+    out: List[str] = []
+    start = 0
+    while start < len(sentences):
+        size, end, best, best_distance = 0, start, None, -1.0
+        while end < len(sentences) and size + len(sentences[end]) + (1 if size else 0) <= max_chars:
+            size += len(sentences[end]) + (1 if size else 0)
+            end += 1
+            if size >= min_chars and end < len(sentences) and distances[end - 1] > best_distance:
+                best, best_distance = end, distances[end - 1]
+        if end == start:
+            end = start + 1
+        cut = end if end >= len(sentences) or best is None else best
+        out.append(" ".join(sentences[start:cut]))
+        start = cut
+    return out
+
+
+def _cosine_distance(a: List[float], b: List[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    norm = (sum(x * x for x in a) * sum(y * y for y in b)) ** 0.5
+    return 1.0 - (dot / norm if norm else 0.0)
+
+
+async def semantic_pieces(env, sources: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+    """Chunks for every section longer than one chunk, split by meaning.
+
+    Returns ``{section text: [chunk, ...]}`` for :func:`build_chunks`. Each
+    sentence is embedded together with the sentences either side of it, so
+    one short sentence doesn't look like a change of topic. Sections past
+    MAX_SEMANTIC_SENTENCES are left out (split the plain way).
+    """
+    plans, windows = [], []
+    for src in sources:
+        for section in prepared_sections(src):
+            text = section["text"]
+            if len(text) <= CHUNK_MAX_CHARS or any(text == p[0] for p in plans):
+                continue
+            sentences = sentences_of(text)
+            if len(sentences) < 2 or len(windows) + len(sentences) > MAX_SEMANTIC_SENTENCES:
+                continue
+            plans.append((text, sentences, len(windows)))
+            windows += [" ".join(sentences[max(0, i - 1): i + 2]) for i in range(len(sentences))]
+    if not windows:
+        return {}
+    vectors = await embed_texts(env, windows)
+    pieces = {}
+    for text, sentences, start in plans:
+        v = vectors[start: start + len(sentences)]
+        distances = [_cosine_distance(v[i], v[i + 1]) for i in range(len(v) - 1)]
+        pieces[text] = pack_sentences(sentences, distances)
+    return pieces
+
+
+def build_chunks(activity_id: str, sources: List[Dict[str, Any]],
+                 pieces: Optional[Dict[str, List[str]]] = None) -> List[Dict[str, Any]]:
     """Turn source documents into chunk records.
 
     Each source is ``{"source_type", "source_id", "title"}`` plus either
     ``"text"`` or ``"sections"`` (see :func:`source_sections`). Chunks are
-    numbered across the whole source, so ids stay unique.
+    numbered across the whole source, so ids stay unique. A section found in
+    *pieces* (from :func:`semantic_pieces`) uses those chunks; any other is
+    split by :func:`chunk_text`.
     """
     out: List[Dict[str, Any]] = []
-    seen = set()   # normalised text of every chunk so far: each is indexed once
+    seen = set()
     for src in sources:
         source_type = str(src.get("source_type") or "")
         if source_type not in SOURCE_TYPES:
@@ -214,11 +310,10 @@ def build_chunks(activity_id: str, sources: List[Dict[str, Any]]) -> List[Dict[s
         source_id = str(src.get("source_id") or "")
         title = str(src.get("title") or "").strip()[:200]
         index = 0
-        sections = [{"locator": sec["locator"], "text": clean_text(sec["text"])}
-                    for sec in source_sections(src)]
-        for section in merge_short_sections(sections):
+        for section in prepared_sections(src):
             locator = section["locator"]
-            for piece in chunk_text(section["text"]):
+            split = (pieces or {}).get(section["text"]) or chunk_text(section["text"])
+            for piece in split:
                 key = " ".join(piece.lower().split())
                 if key in seen:
                     continue
@@ -244,10 +339,6 @@ def _batches(items: List[Any], size: int):
     for i in range(0, len(items), size):
         yield items[i:i + size]
 
-
-# ---------------------------------------------------------------------------
-# Workers AI / Vectorize interop
-# ---------------------------------------------------------------------------
 
 def _js(obj):
     return to_js(obj, dict_converter=js.Object.fromEntries)
@@ -277,18 +368,11 @@ def is_configured(env) -> bool:
         return False
 
 
-# ---------------------------------------------------------------------------
-# File text extraction (R2 → located sections)
-# ---------------------------------------------------------------------------
-
 Sections = List[Dict[str, str]]
 
 PLAIN_TEXT_TYPES = {".txt": "text/plain"}
 MARKDOWN_TYPES = {".md": "text/markdown", ".markdown": "text/markdown"}
 PPTX_TYPE = ".pptx"
-# Converted by Workers AI toMarkdown() (no PowerPoint support there, hence our
-# own .pptx parser). Images are deliberately excluded: they go through a paid
-# vision model and rarely carry course text.
 CONVERTIBLE_TYPES = {
     ".pdf": "application/pdf",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -305,9 +389,8 @@ SAVE_AS_HINTS = {
     ".odp": "OpenDocument slides are not supported — save as .pptx or PDF",
     ".doc": "old Word format — save it as .docx or PDF",
 }
-MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_EXTRACTED_CHARS = 200_000
-MAX_PPTX_XML_BYTES = 20 * 1024 * 1024   # uncompressed; guards against zip bombs
+MAX_PPTX_XML_BYTES = 20 * 1024 * 1024
 MAX_SLIDES = 500
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
@@ -342,7 +425,7 @@ def split_markdown_sections(markdown: str) -> Sections:
     """
     sections: Sections = []
     locator, lines = "", []
-    page = None   # (heading level, page number) of the enclosing "Page N" heading
+    page = None
 
     def flush():
         body = "\n".join(l for l in lines if not _HEADING_RE.match(l.strip()))
@@ -401,8 +484,6 @@ def _rels(zf: zipfile.ZipFile, part: str) -> Dict[str, Tuple[str, str]]:
     return out
 
 
-# Placeholders that hold boilerplate (slide numbers, dates, footers, the
-# slide thumbnail on notes pages), never course content.
 _SKIP_PLACEHOLDERS = {"sldNum", "dt", "ftr", "hdr", "sldImg"}
 
 
@@ -456,7 +537,7 @@ def extract_pptx_sections(data: bytes) -> Sections:
                 rel = rels.get(sld.get(f"{{{_NS['r']}}}id"))
                 if rel and rel[1] in names:
                     slides.append(rel[1])
-        if not slides:   # fall back to file-name order
+        if not slides:
             slides = sorted((n for n in names if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)),
                             key=_slide_number)
 
@@ -492,9 +573,6 @@ async def extract_file_sections(env, bucket, key: str) -> Tuple[Sections, Option
     obj = await bucket.get(key)
     if not obj:
         return [], "file not found in storage"
-    size = int(getattr(obj, "size", 0) or 0)
-    if size > MAX_FILE_BYTES:
-        return [], f"file is larger than {MAX_FILE_BYTES // (1024 * 1024)} MB"
     buf = await obj.arrayBuffer()
 
     if ext in PLAIN_TEXT_TYPES:
@@ -538,10 +616,6 @@ async def embed_texts(env, texts: List[str]) -> List[List[float]]:
     return vectors
 
 
-# ---------------------------------------------------------------------------
-# Indexing
-# ---------------------------------------------------------------------------
-
 async def index_activity(env, activity_id: str, sources: List[Dict[str, Any]],
                          encrypt: Crypt) -> Dict[str, int]:
     """Bring the activity's index in line with *sources*.
@@ -550,7 +624,13 @@ async def index_activity(env, activity_id: str, sources: List[Dict[str, Any]],
     source disappeared are removed from both Vectorize and D1.
     """
     _, index = _bindings(env)
-    desired = build_chunks(activity_id, sources)
+    pieces = None
+    if SEMANTIC_CHUNKING:
+        try:
+            pieces = await semantic_pieces(env, sources)
+        except Exception as exc:
+            print(json.dumps({"level": "warn", "where": "tutor_rag.semantic_pieces", "error": str(exc)[:200]}))
+    desired = build_chunks(activity_id, sources, pieces)
     desired_ids = {c["id"] for c in desired}
 
     existing_res = await env.DB.prepare(
@@ -610,10 +690,6 @@ async def index_activity(env, activity_id: str, sources: List[Dict[str, Any]],
     }
 
 
-# ---------------------------------------------------------------------------
-# Retrieval
-# ---------------------------------------------------------------------------
-
 async def embed_queries(env, queries: List[str]) -> List[List[float]]:
     """Embed search queries. BGE v1.5 is trained to embed a short query with
     this instruction in front, and passages without it."""
@@ -643,6 +719,38 @@ async def rerank(env, query: str, hits: List[Dict[str, Any]]) -> List[Dict[str, 
     return sorted(hits, key=lambda h: h["rerank_score"], reverse=True)
 
 
+_KEYWORD_WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
+
+
+def _keyword_re(keyword: str):
+    words = _KEYWORD_WORD_RE.findall(keyword.lower())
+    if not words:
+        return None
+    return re.compile(r"\b" + r"[\s\-']+".join(re.escape(w) for w in words) + r"(?:s|es)?\b", re.IGNORECASE)
+
+
+def keyword_boost(hits: List[Dict[str, Any]], keywords: List[str], weight: float) -> List[Dict[str, Any]]:
+    """Reorder *hits*, adding ``weight * coverage`` to each one's score.
+
+    coverage is the share of *keywords* found in the hit's text (not its
+    title, which every chunk of a page shares), each keyword weighted by how
+    rare it is among *hits* (idf): a keyword every candidate contains adds
+    nothing. The score is the reranker's when there is one, else the vector
+    similarity. Each hit gains ``keyword_coverage``.
+    """
+    patterns = [p for p in (_keyword_re(k) for k in keywords or []) if p]
+    if not patterns or not hits or weight <= 0:
+        return hits
+    found = [[bool(p.search(h.get("text") or "")) for p in patterns] for h in hits]
+    n = len(hits)
+    idf = [math.log((n + 1) / (1 + sum(row[i] for row in found))) for i in range(len(patterns))]
+    total = sum(idf)
+    for hit, row in zip(hits, found):
+        hit["keyword_coverage"] = round(sum(w for w, f in zip(idf, row) if f) / total, 4) if total else 0.0
+    base = lambda h: h["rerank_score"] if "rerank_score" in h else h.get("score", 0.0)   # noqa: E731
+    return sorted(hits, key=lambda h: base(h) + weight * h["keyword_coverage"], reverse=True)
+
+
 def _clean_queries(queries) -> List[str]:
     queries = [queries] if isinstance(queries, str) else list(queries or [])
     return list(dict.fromkeys(q for q in ((q or "").strip()[:MAX_QUERY_CHARS] for q in queries) if q))
@@ -651,11 +759,13 @@ def _clean_queries(queries) -> List[str]:
 async def retrieve(env, activity_id: str, query: Union[str, List[str]], decrypt: Crypt,
                    top_k: int = 5, min_score: float = 0.0,
                    rerank_query: Optional[str] = None,
-                   extra_queries: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+                   extra_queries: Optional[List[str]] = None,
+                   keywords: Optional[List[str]] = None,
+                   keyword_weight: float = 0.0) -> List[Dict[str, Any]]:
     """Return the activity's chunks most relevant to *query*, best first.
 
-    *query* may be a list of alternative queries (e.g. the question, and the
-    question with the previous one for context). *extra_queries* (rewrites
+    *query* may be a list of alternative queries, each searched as deeply
+    as a question. *extra_queries* (rewrites
     of the question) each add their best *top_k* chunks as candidates. All
     are embedded in one call; each chunk keeps its best score across them,
     and only chunks scoring at least *min_score* for some query are kept.
@@ -666,6 +776,10 @@ async def retrieve(env, activity_id: str, query: Union[str, List[str]], decrypt:
     used. Rewrites only ever add candidates: answer-like rewrites score
     higher than questions do, and when they shared one candidate list they
     crowded out the question's own passages (CRAG: 44 vs 47 of 58).
+
+    With *keywords* and a *keyword_weight* (and a *rerank_query*, so the
+    whole candidate pool is loaded), candidates containing the keywords
+    move up before the best *top_k* are kept (see :func:`keyword_boost`).
 
     Each hit carries what a caller needs to cite it: source type/id/title,
     locator (e.g. "slide 7"), chunk index, text, and similarity score.
@@ -720,6 +834,8 @@ async def retrieve(env, activity_id: str, query: Union[str, List[str]], decrypt:
     if rerank_query and len(hits) > 1:
         try:
             hits = await rerank(env, rerank_query, hits)
-        except Exception as exc:   # a reranker outage shouldn't take the tutor down
+        except Exception as exc:
             print(json.dumps({"level": "warn", "where": "tutor_rag.rerank", "error": str(exc)[:200]}))
+    if rerank_query and keywords and keyword_weight > 0:
+        hits = keyword_boost(hits, keywords, keyword_weight)
     return hits[:top_k]

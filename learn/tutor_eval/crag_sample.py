@@ -69,8 +69,6 @@ def balanced_pick(pool, n: int):
     for i, qtype in enumerate(order):
         by_domain = by_type[qtype]
         domains = sorted(by_domain, key=lambda d: (d not in DOMAINS, d))
-        # Start each type on a different domain, so any first-N slice of the
-        # sample mixes domains as well as types.
         domains = domains[i % len(domains):] + domains[:i % len(domains)]
         queues = [by_domain[d] for d in domains]
         per_type[qtype] = [ex for group in itertools.zip_longest(*queues) for ex in group if ex]

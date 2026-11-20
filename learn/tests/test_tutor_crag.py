@@ -47,7 +47,6 @@ class TestScorePrediction:
         judge = _judge(1)
         assert crag_scoring.score_prediction("q", ["invalid question"], "This is an invalid question.",
                                              judge)["outcome"] == "correct"
-        # only one side says invalid: wrong, and the judge is never asked
         assert crag_scoring.score_prediction("q", ["invalid question"], "Hamburg, in 1871.",
                                              judge)["outcome"] == "hallucination"
         assert judge.calls == []
@@ -105,7 +104,6 @@ class TestSample:
         pool = [self._ex(t, d, n) for t in ("simple", "comparison") for d in ("finance", "movie") for n in range(3)]
         picked = crag_sample.balanced_pick(pool, 4)
         assert [e["question_type"] for e in picked] == ["simple", "comparison", "simple", "comparison"]
-        # each type starts on a different domain, so a short slice mixes domains
         assert {e["domain"] for e in picked[:2]} == {"finance", "movie"}
 
     def test_takes_what_exists(self):
@@ -123,7 +121,6 @@ class TestBudget:
         import run_crag
         ai = run_crag.LocalAI("workers-ai", "http://127.0.0.1:9", "unused", tmp_path / "cache.json",
                               budget_neurons=50)
-        # ~4,000 characters in + 350 tokens out is ~100 neurons: over the 50 left, so no request is made
         import pytest
         with pytest.raises(run_crag.BudgetExceeded):
             ai.chat([{"role": "user", "content": "x" * 4000}], max_tokens=350)

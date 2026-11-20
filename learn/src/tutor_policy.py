@@ -126,8 +126,6 @@ def refusal_message(topic: str) -> str:
             "Please ask your teacher about this directly.")
 
 
-# The ANSWER line is never shown to the student: tutor_hints checks the HINT
-# against it in code, because the prompt alone still leaked about 1 in 8.
 HINT_ONLY_RULE = """- HINT-ONLY MODE (set by the teacher): the student must work the answer out themselves.
   Reply in exactly two parts:
   ANSWER: the answer in a few words, with its citation. The student never sees this line.

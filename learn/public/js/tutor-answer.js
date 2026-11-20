@@ -1,15 +1,3 @@
-/*
- * Shared rendering for AI tutor answers (activity page + teacher panel).
- *
- * A1Tutor.answerHtml(answer, citations, { withText }) returns HTML for an
- * answer whose [n] markers link to a "Where this came from" list. With
- * withText, each source expands to show the passage the answer used.
- * Everything from the server is escaped; only markers that match a citation
- * become links.
- *
- * Wrap each rendered answer in an element with class "tutor-answer" so a
- * click on [n] opens the matching source within that same answer.
- */
 (function () {
   'use strict';
 
