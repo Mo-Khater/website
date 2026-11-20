@@ -7,7 +7,7 @@ injection, and (in hints-only mode) avoid giving answers away?
 It runs against a real `learn` worker over HTTP, so it tests the whole
 system: retrieval, the model, the citation check, and the policy rules.
 
-To test the retrieval pipeline on real-world web pages, use Meta's CRAG benchmark; see [CRAG.md](CRAG.md).
+To test the retrieval pipeline on real-world web pages, use Meta's CRAG benchmark; see [CRAG.md](CRAG.md). For PDFs, see [QASPER.md](QASPER.md). The latest eval-set results are in [EVAL_SET.md](EVAL_SET.md).
 
 ## What's in it
 
